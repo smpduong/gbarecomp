@@ -1293,7 +1293,14 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
             cfg.channels    = 1;
             cfg.source_rate = 65536.0;                 // engine's standardized GBA mixer rate
             cfg.host_rate   = static_cast<double>(got.freq);
-            cfg.target_ms   = 60.0;                     // steady cushion (matches NES)
+            cfg.target_ms   = 35.0;                     // steady cushion: lower SFX
+                                                        // onset latency (was 60;
+                                                        // user-reported delayed
+                                                        // SFX with a healthy
+                                                        // bridge). Stays above
+                                                        // the 12ms emergency
+                                                        // floor; underruns
+                                                        // stretch-conceal.
             cfg.preroll_ms  = 250.0;                    // boot pre-roll: hide the cold-start
                                                         // recomp warm-up hitch (drains to target)
             if (rab_init(&b->bridge, &cfg) == 0) b->bridge_ready = true;
