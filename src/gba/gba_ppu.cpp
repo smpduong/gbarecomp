@@ -1213,8 +1213,10 @@ void render_scanline_internal(uint8_t* rgb,
                 }
                 const uint16_t color = load_u16_le(&obj_pal[pal_index * 2]);
                 uint32_t ux = static_cast<uint32_t>(screen_x);
+                // GBATEK BLDCNT bit 4 makes every OBJ a 1st target; mode-1
+                // (semi-transparent) OBJs are forced targets regardless.
                 bool t1 = blend_enabled(ux) &&
-                    obj_mode == 1;
+                    ((((first_targets & (1u << 4)) != 0)) || obj_mode == 1);
                 submit(ux, color, key, 4, t1, obj_target2);
             };
             if (rot_scale) {
@@ -1880,7 +1882,9 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
                 }
                 const uint16_t color = load_u16_le(&obj_pal[pal_index * 2]);
                 uint32_t ux = static_cast<uint32_t>(screen_x);
-                bool t1 = blend_enabled(ux) && obj_mode == 1;
+                // Same BLDCNT-bit-4 rule as the main path above.
+                bool t1 = blend_enabled(ux) &&
+                    ((((first_targets & (1u << 4)) != 0)) || obj_mode == 1);
                 submit(ux, color, key, 4, t1, obj_target2);
             };
             if (rot_scale) {
