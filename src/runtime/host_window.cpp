@@ -1245,7 +1245,9 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     want.freq     = 65536;
     want.format   = AUDIO_S16SYS;
     want.channels = 1;
-    want.samples  = 1024;  // ~15 ms callback quantum at 65 kHz
+    want.samples  = 512;   // ~8 ms callback quantum at 65 kHz (was 1024;
+                            // trims device-side onset latency for SFX; underrun
+                            // risk covered by the bridge stretch concealer)
     const char* direct_audio_env = std::getenv("GBARECOMP_AUDIO_DIRECT");
     b->audio_direct =
         direct_audio_env && *direct_audio_env && *direct_audio_env != '0';
@@ -1293,10 +1295,10 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
             cfg.channels    = 1;
             cfg.source_rate = 65536.0;                 // engine's standardized GBA mixer rate
             cfg.host_rate   = static_cast<double>(got.freq);
-            cfg.target_ms   = 35.0;                     // steady cushion: lower SFX
+            cfg.target_ms   = 25.0;                     // steady cushion: lower SFX
                                                         // onset latency (was 60;
-                                                        // user-reported delayed
-                                                        // SFX with a healthy
+                                                        // user-reported 100-200ms
+                                                        // delay with a healthy
                                                         // bridge). Stays above
                                                         // the 12ms emergency
                                                         // floor; underruns
