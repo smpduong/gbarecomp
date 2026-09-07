@@ -1306,6 +1306,15 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
             cfg.preroll_ms  = 250.0;                    // boot pre-roll: hide the cold-start
                                                         // recomp warm-up hitch (drains to target)
             if (rab_init(&b->bridge, &cfg) == 0) b->bridge_ready = true;
+            std::fprintf(stderr,
+                         "host_window: audio=bridge driver=%s device=%s "
+                         "want=65536Hz/512 cushion=%.0fms got=%dHz/%u\n",
+                         SDL_GetCurrentAudioDriver()
+                             ? SDL_GetCurrentAudioDriver() : "(unknown)",
+                         audio_device_name ? audio_device_name : "(default)",
+                         cfg.target_ms, got.freq,
+                         static_cast<unsigned>(got.samples));
+            std::fflush(stderr);
             SDL_PauseAudioDevice(b->audio_dev, 0);      // start the callback
         }
     }
