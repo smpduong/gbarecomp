@@ -86,6 +86,9 @@ extern "C" unsigned long long g_runtime_irq_entries;
 void runtime_set_frame_present_hook(std::function<bool()>);
 void runtime_set_host_service_hook(std::function<void()>);
 void runtime_set_frame_start_hook(std::function<void()>);
+bool runtime_host_unwind_safe();
+void runtime_request_host_control_yield();
+void runtime_clear_host_control_yield();
 
 #ifndef GBARECOMP_DEFAULT_GAME_CONFIG
 #define GBARECOMP_DEFAULT_GAME_CONFIG "game.toml"
@@ -2765,7 +2768,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     }
 
     std::vector<InputTraceEvent> input_replay_events;
-    std::size_t input_replay_index = 0;
     if (input_replay_requested) {
         std::ifstream replay(input_replay_env);
         if (!replay) {
@@ -2810,16 +2812,44 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         std::printf("input_replay=DISABLED\n");
     }
 
+    const bool input_apply_probe = [] {
+        const char* e = std::getenv("GBARECOMP_EVENT_PROBE");
+        return e && e[0] && !(e[0] == '0' && e[1] == '\0');
+    }();
+    uint16_t last_applied_keyinput = 0xFFFFu;
+    unsigned long long input_apply_epoch = g_runtime_state_epoch;
+    auto apply_guest_keyinput = [&](uint16_t keys) {
+        // A restore can reinstate a different KEYINPUT value even when the
+        // next sampled host/replay input equals the pre-restore value. Establish
+        // a fresh diagnostic baseline on every restored state, including loads
+        // that keep the same frame number.
+        if (input_apply_epoch != g_runtime_state_epoch) {
+            input_apply_epoch = g_runtime_state_epoch;
+            last_applied_keyinput = 0xFFFFu;
+        }
+        bus.io().set_keyinput(keys);
+        if (input_apply_probe && keys != last_applied_keyinput) {
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            std::fprintf(stderr,
+                "[event-probe] input_apply_ns=%lld frame=%llu keyinput=0x%04X\n",
+                static_cast<long long>(ns),
+                static_cast<unsigned long long>(ppu.frame_count()), keys);
+        }
+        last_applied_keyinput = keys;
+    };
+
     auto apply_input_replay = [&]() {
         if (!input_replay_requested) return;
         const uint64_t frame = ppu.frame_count();
-        while (input_replay_index + 1 < input_replay_events.size() &&
-               input_replay_events[input_replay_index + 1].frame <= frame) {
-            ++input_replay_index;
-        }
-        if (input_replay_events[input_replay_index].frame <= frame)
-            bus.io().set_keyinput(
-                input_replay_events[input_replay_index].keyinput);
+        // A save load or rewind can move guest time in either direction. Seek
+        // from the frame itself rather than retaining a forward-only cursor.
+        // upper_bound also preserves the last-event-wins rule for equal frames.
+        const auto next = std::upper_bound(
+            input_replay_events.begin(), input_replay_events.end(), frame,
+            [](uint64_t f, const InputTraceEvent& event) { return f < event.frame; });
+        apply_guest_keyinput(next == input_replay_events.begin()
+            ? 0x03FFu : (next - 1)->keyinput);
     };
 
     // Optional monotonic-pump Assist action script for automated validation.
@@ -2907,9 +2937,25 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                         assist_script_events.size());
     }
 
+    // A present-in-place callback still has generated code on the host stack,
+    // including potentially an IRQ handler. Snapshot/restore and pause actions
+    // must survive that callback and run only after a safe cooperative unwind.
+    bool in_frame_present_hook = false;
+    bool pending_rewind_capture = false;
+    std::deque<HostWindow::Events> pending_state_controls;
     auto pump_host_input = [&]() {
         if (!args.window) return;
-        capture_rewind_point();
+        const bool at_control_boundary =
+            !in_frame_present_hook && runtime_host_unwind_safe();
+        if (at_control_boundary) {
+            runtime_clear_host_control_yield();
+            pending_rewind_capture = false;
+            capture_rewind_point();
+        } else if (rewind_capacity && assist_tools_enabled() &&
+                   ppu.frame_count() >= next_rewind_capture_frame) {
+            pending_rewind_capture = true;
+            runtime_request_host_control_yield();
+        }
         auto ev = win.pump();
         ++assist_script_pump;
         while (assist_script_index < assist_script_events.size() &&
@@ -2940,7 +2986,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             std::fflush(stdout);
         }
         ev.fast_forward = ev.fast_forward || assist_script_fast;
-        if (!input_replay_requested) bus.io().set_keyinput(ev.keyinput);
+        if (!input_replay_requested) apply_guest_keyinput(ev.keyinput);
         if (bus.gyro().active()) {
             // Mouse-drag is angular velocity, not absolute angle: moving while
             // held produces rotation and holding still returns to center.
@@ -3018,12 +3064,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         if (ev.volume_up)   win.set_volume(win.volume() + 10);
         if (ev.volume_down) win.set_volume(win.volume() - 10);
         if (ev.toggle_fps)  win.set_fps_readout(!win.fps_readout());
-        if (ev.toggle_pause) {
-            host_paused = !host_paused;
-            // Realign the pacer on unpause so it doesn't burn the
-            // accumulated wall-clock lag catching up.
-            if (!host_paused && pacer) pacer->reset();
-        }
 #if defined(GBARECOMP_RUNTIME_UI)
         // Fold a menu request into the hotkey path so save/load has exactly
         // one implementation regardless of how the player asked for it.
@@ -3040,80 +3080,98 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             ev.save_slot = 0;
             ev.load_slot = 0;
         }
-        if (ev.save_slot) {
-            std::string path = slot_path(ev.save_slot);
-            std::string e;
-            if (do_savestate_save(path, e)) {
-                std::printf("savestate_saved slot=%d path=\"%s\"\n",
-                            ev.save_slot, path.c_str());
-                std::fflush(stdout);
-            } else {
-                std::fprintf(stderr,
-                             "[gbarecomp:runtime] savestate save (slot %d) "
-                             "failed: %s\n", ev.save_slot, e.c_str());
-            }
-        }
-        if (ev.load_slot) {
-            std::string path = slot_path(ev.load_slot);
-            std::string e;
-            if (do_savestate_load(path, e)) {
-                std::printf("savestate_loaded slot=%d path=\"%s\" pc=0x%08x "
-                            "frame=%llu\n", ev.load_slot, path.c_str(),
-                            g_cpu.R[15],
-                            static_cast<unsigned long long>(ppu.frame_count()));
-                std::fflush(stdout);
-                // Force the next iteration to re-present the restored
-                // frame instead of waiting for frame_count to advance.
-                last_presented_frame = ppu.frame_count() - 1;
-                // The load jumped guest time; realign the pacer so it
-                // doesn't burn the accumulated lag catching up.
-                if (pacer) pacer->reset();
-                rewind_history.clear();
-                next_rewind_capture_frame = ppu.frame_count();
-            } else {
-                std::fprintf(stderr,
-                             "[gbarecomp:runtime] savestate load (slot %d) "
-                             "failed: %s\n", ev.load_slot, e.c_str());
-            }
-        }
         bool rewind_requested = ev.rewind;
 #if defined(GBARECOMP_RUNTIME_UI)
         rewind_requested = rewind_requested ||
                            runtime_ui_context.pending_rewind;
         runtime_ui_context.pending_rewind = false;
 #endif
-        if (rewind_requested && assist_tools_enabled()) {
-            const uint64_t current = ppu.frame_count();
-            const uint64_t target = current > 60 ? current - 60 : 0;
-            std::size_t target_index = rewind_history.size();
-            for (std::size_t i = rewind_history.size(); i > 0; --i) {
-                if (rewind_history[i - 1].frame <= target) {
-                    target_index = i - 1;
-                    break;
-                }
+        ev.rewind = rewind_requested && assist_tools_enabled();
+        if (ev.save_slot || ev.load_slot || ev.rewind || ev.toggle_pause)
+            pending_state_controls.push_back(ev);
+        if (!at_control_boundary) {
+            if (!pending_state_controls.empty())
+                runtime_request_host_control_yield();
+            return;
+        }
+        // Preserve every queued edge-triggered action, in arrival order. Do not
+        // coalesce two pause toggles or replace a requested save with a load.
+        while (!pending_state_controls.empty()) {
+            ev = pending_state_controls.front();
+            pending_state_controls.pop_front();
+            if (ev.toggle_pause) {
+                host_paused = !host_paused;
+                if (!host_paused && pacer) pacer->reset();
             }
-            if (target_index == rewind_history.size()) {
-                std::fprintf(stderr,
-                             "[gbarecomp:runtime] rewind history is not "
-                             "ready yet\n");
-            } else {
+            if (ev.save_slot) {
+                std::string path = slot_path(ev.save_slot);
                 std::string e;
-                if (do_savestate_load_bytes(
-                        rewind_history[target_index].state, e)) {
-                    while (rewind_history.size() > target_index + 1)
-                        rewind_history.pop_back();
-                    last_presented_frame = ppu.frame_count() - 1;
-                    next_rewind_capture_frame =
-                        ppu.frame_count() + rewind_interval;
-                    if (pacer) pacer->reset();
-                    std::printf("rewind_loaded frame=%llu\n",
-                                static_cast<unsigned long long>(
-                                    ppu.frame_count()));
+                if (do_savestate_save(path, e)) {
+                    std::printf("savestate_saved slot=%d path=\"%s\"\n",
+                                ev.save_slot, path.c_str());
                     std::fflush(stdout);
                 } else {
                     std::fprintf(stderr,
-                                 "[gbarecomp:runtime] rewind failed: %s\n",
-                                 e.c_str());
+                                 "[gbarecomp:runtime] savestate save (slot %d) "
+                                 "failed: %s\n", ev.save_slot, e.c_str());
+                }
+            }
+            if (ev.load_slot) {
+                std::string path = slot_path(ev.load_slot);
+                std::string e;
+                if (do_savestate_load(path, e)) {
+                    std::printf("savestate_loaded slot=%d path=\"%s\" pc=0x%08x "
+                                "frame=%llu\n", ev.load_slot, path.c_str(),
+                                g_cpu.R[15],
+                                static_cast<unsigned long long>(ppu.frame_count()));
+                    std::fflush(stdout);
+                    // Force the next iteration to re-present the restored
+                    // frame instead of waiting for frame_count to advance.
+                    last_presented_frame = ppu.frame_count() - 1;
+                    // The load jumped guest time; realign the pacer so it
+                    // doesn't burn the accumulated lag catching up.
+                    if (pacer) pacer->reset();
+                    rewind_history.clear();
+                    next_rewind_capture_frame = ppu.frame_count();
+                } else {
+                    std::fprintf(stderr,
+                                 "[gbarecomp:runtime] savestate load (slot %d) "
+                                 "failed: %s\n", ev.load_slot, e.c_str());
+                }
+            }
+            if (ev.rewind) {
+                const uint64_t current = ppu.frame_count();
+                const uint64_t target = current > 60 ? current - 60 : 0;
+                std::size_t target_index = rewind_history.size();
+                for (std::size_t i = rewind_history.size(); i > 0; --i) {
+                    if (rewind_history[i - 1].frame <= target) {
+                        target_index = i - 1;
+                        break;
+                    }
+                }
+                if (target_index == rewind_history.size()) {
+                    std::fprintf(stderr,
+                                 "[gbarecomp:runtime] rewind history is not "
+                                 "ready yet\n");
+                } else {
+                    std::string e;
+                    if (do_savestate_load_bytes(
+                            rewind_history[target_index].state, e)) {
+                        while (rewind_history.size() > target_index + 1)
+                            rewind_history.pop_back();
+                        last_presented_frame = ppu.frame_count() - 1;
+                        next_rewind_capture_frame =
+                            ppu.frame_count() + rewind_interval;
+                        if (pacer) pacer->reset();
+                        std::printf("rewind_loaded frame=%llu\n",
+                                    static_cast<unsigned long long>(
+                                        ppu.frame_count()));
+                        std::fflush(stdout);
+                    } else {
+                        std::fprintf(stderr,
+                                     "[gbarecomp:runtime] rewind failed: %s\n",
+                                     e.c_str());
+                    }
                 }
             }
         }
@@ -3147,6 +3205,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                      "(frame-boundary resume misses eliminated structurally; "
                      "GBARECOMP_PRESENT_IN_PLACE=0 to disable)\n");
         runtime_set_frame_present_hook([&]() -> bool {
+            in_frame_present_hook = true;
             uint64_t frame = ppu.frame_count();
             if (frame != last_presented_frame) {
                 const uint64_t fp_t0 = FramePhaseRing::now_ns();
@@ -3154,7 +3213,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     (frame % static_cast<uint64_t>(
                          fast_forward_multiplier) == 0);
                 if (present_frame) {
-                    const bool view_changed = sync_resize_driven_view();
+                    // View changes can invoke game-owned callbacks; keep them
+                    // outside a live exception handler as well.
+                    const bool view_changed = runtime_host_unwind_safe() &&
+                                              sync_resize_driven_view();
                     if (ppu.has_latched_framebuffer() && !view_changed) {
                         std::memcpy(live_fb.data(), ppu.latched_framebuffer(),
                                     ppu.render_bytes());
@@ -3166,6 +3228,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 }
                 const uint64_t fp_t1 = FramePhaseRing::now_ns();
                 if (present_frame) win.present(live_fb.data());
+                // Preserve the same diagnostic capture path while the guest
+                // remains on its host stack (including protected IRQ frames).
+                if (framedump_dir && frame >= framedump_start &&
+                    framedump_written < framedump_max) {
+                    char p[512];
+                    std::snprintf(p, sizeof(p), "%s/f_%06llu.png", framedump_dir,
+                                  static_cast<unsigned long long>(frame));
+                    write_png(p, live_fb.data(), ppu.render_width(),
+                              ppu.render_height());
+                    if (++framedump_written >= framedump_max) host_quit = true;
+                }
                 const uint64_t fp_t2 = FramePhaseRing::now_ns();
                 int16_t audio_buf[2048];
                 std::size_t n = bus.audio().drain_samples(audio_buf, 2048);
@@ -3184,13 +3257,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 last_presented_frame = frame;
                 if (present_frame) {
                     ++frames_presented;
-                    if (args.frames >= 0 && frames_presented >= args.frames)
+                    if (args.frames >= 0 && frames_presented >= args.frames) {
                         host_quit = true;
+                        frame_phase.dump();
+                    }
                     if (pacer) pacer->wait_for_next_frame();
                 }
                 frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3, fp_t4,
                                    FramePhaseRing::now_ns());
+
             }
+            in_frame_present_hook = false;
             return host_quit;
         });
     }
@@ -3462,6 +3539,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
         if (host_quit) break;
         if (!step_once()) break;
+        if (args.window && runtime_host_unwind_safe() &&
+            (pending_rewind_capture || !pending_state_controls.empty())) {
+            pump_host_input();
+        }
         if (input_replay_requested) {
             apply_input_replay();
         } else if (demo_input) {
@@ -3491,7 +3572,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                         : (demo_campaign && fc >= kCampaignWalkStart)
                             ? walk_keyinput_for_frame(fc - kCampaignWalkStart)
                             : demo_keyinput_for_frame(fc);
-                bus.io().set_keyinput(keys);
+                apply_guest_keyinput(keys);
             }
         }
         // Widescreen sidecar: capture the live tilemap ring once per guest
@@ -3563,6 +3644,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     ++frames_presented;
                     if (args.frames >= 0 && frames_presented >= args.frames) {
                         host_quit = true;
+                        frame_phase.dump();
                     }
                     // Normal play presents/paces every frame. Fast-forward
                     // runs N guest frames per one paced host presentation,
