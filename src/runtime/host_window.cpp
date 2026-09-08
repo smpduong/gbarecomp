@@ -322,10 +322,26 @@ struct Backend {
     };
     std::array<TouchPoint, 10> touches{};
     bool touch_controls = false;
+    uint16_t prev_keyinput = 0xFFFF;  // force a first-change stamp
     // Callback-driven clock-domain bridge (replaces SDL queue push).
     rab_bridge    bridge{};
     bool          bridge_ready = false;
     SDL_mutex*    audio_mtx = nullptr;
+    // Opt-in bounded callback observations. The real-time callback only fills
+    // this fixed array while already holding audio_mtx; the producer logs it.
+    struct AudioPullObservation {
+        int64_t ns = 0;
+        uint64_t pulled = 0;
+        uint64_t stretched = 0;
+        int frames = 0;
+        double fill_before_ms = 0;
+        double fill_after_ms = 0;
+        double source_pos = 0;
+    };
+    bool audio_event_probe = false;
+    std::array<AudioPullObservation, 64> audio_pull_observations{};
+    std::size_t audio_pull_count = 0;
+    uint64_t audio_pull_dropped = 0;
     // Diagnostic/direct path: let SDL own format conversion and queue the
     // engine's verified 65536 Hz mono stream without passing it through RAB.
     bool          audio_direct = false;
@@ -390,6 +406,35 @@ struct Backend {
     // MC-WS-002: always-on per-present timing/scanout ring (see above).
     PresentCadence cadence;
 };
+
+static void emit_audio_pull_observations(Backend* b) {
+    if (!b || !b->audio_event_probe || !b->audio_mtx) return;
+
+    std::array<Backend::AudioPullObservation, 64> observations;
+    std::size_t observed = 0;
+    uint64_t dropped = 0;
+    SDL_LockMutex(b->audio_mtx);
+    observed = std::min(observations.size(), b->audio_pull_count);
+    std::copy_n(b->audio_pull_observations.begin(), observed,
+                observations.begin());
+    b->audio_pull_count = 0;
+    dropped = b->audio_pull_dropped;
+    b->audio_pull_dropped = 0;
+    SDL_UnlockMutex(b->audio_mtx);
+    for (std::size_t i = 0; i < observed; ++i) {
+        const auto& o = observations[i];
+        std::fprintf(stderr,
+            "[event-probe] audio_pull_ns=%lld frames=%d pulled=%llu "
+            "fill_before_ms=%.3f fill_after_ms=%.3f source_pos=%.3f stretched=%llu\n",
+            static_cast<long long>(o.ns), o.frames,
+            static_cast<unsigned long long>(o.pulled),
+            o.fill_before_ms, o.fill_after_ms, o.source_pos,
+            static_cast<unsigned long long>(o.stretched));
+    }
+    if (dropped)
+        std::fprintf(stderr, "[event-probe] audio_pull_observations_dropped=%llu\n",
+                     static_cast<unsigned long long>(dropped));
+}
 
 void destroy_sharp_texture(Backend* b) {
     if (!b) return;
@@ -882,11 +927,33 @@ void gba_audio_callback(void* userdata, Uint8* stream, int len) {
     int frames = len / static_cast<int>(sizeof(int16_t)); // mono
     if (b && b->bridge_ready) {
         SDL_LockMutex(b->audio_mtx);
+        Backend::AudioPullObservation observation;
+        if (b->audio_event_probe) {
+            observation.ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            observation.frames = frames;
+            observation.fill_before_ms = rab_fill_ms(&b->bridge);
+        }
         rab_pull(&b->bridge, reinterpret_cast<int16_t*>(stream), frames);
+        if (b->audio_event_probe) {
+            observation.pulled = b->bridge.stats.pulled_frames;
+            observation.stretched = b->bridge.stats.stretch_frames;
+            observation.fill_after_ms = rab_fill_ms(&b->bridge);
+            observation.source_pos = b->bridge.out_pos;
+            if (b->audio_pull_count < b->audio_pull_observations.size())
+                b->audio_pull_observations[b->audio_pull_count++] = observation;
+            else
+                ++b->audio_pull_dropped;
+        }
         SDL_UnlockMutex(b->audio_mtx);
     } else {
         SDL_memset(stream, 0, len);
     }
+    // NOTE: pull observations are drained on the producer path
+    // (push_audio_samples) and at shutdown (HostWindow::close, after the
+    // device stops). Draining here would take audio_mtx and run fprintf
+    // on the real-time callback thread — never do file I/O or blocking
+    // work in this function.
 }
 
 #if defined(GBARECOMP_RUNTIME_UI)
@@ -1290,6 +1357,8 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
             // after roughly four video frames have been queued.
         } else {
             b->audio_mtx = SDL_CreateMutex();
+            const char* event_probe = std::getenv("GBARECOMP_EVENT_PROBE");
+            b->audio_event_probe = event_probe && event_probe[0] == '1';
             rab_config cfg;
             rab_config_defaults(&cfg);
             cfg.channels    = 1;
@@ -1303,16 +1372,17 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
                                                         // the 12ms emergency
                                                         // floor; underruns
                                                         // stretch-conceal.
-            cfg.preroll_ms  = 250.0;                    // boot pre-roll: hide the cold-start
-                                                        // recomp warm-up hitch (drains to target)
+            // Prime at the steady target. A 250 ms boot cushion persisted into
+            // gameplay: a 0.5% drift servo needs ~45 s to drain its 225 ms excess.
+            cfg.preroll_ms  = 0.0;
             if (rab_init(&b->bridge, &cfg) == 0) b->bridge_ready = true;
             std::fprintf(stderr,
                          "host_window: audio=bridge driver=%s device=%s "
-                         "want=65536Hz/512 cushion=%.0fms got=%dHz/%u\n",
+                         "want=65536Hz/512 cushion=%.0fms preroll=%.0fms got=%dHz/%u\n",
                          SDL_GetCurrentAudioDriver()
                              ? SDL_GetCurrentAudioDriver() : "(unknown)",
                          audio_device_name ? audio_device_name : "(default)",
-                         cfg.target_ms, got.freq,
+                         cfg.target_ms, cfg.preroll_ms, got.freq,
                          static_cast<unsigned>(got.samples));
             std::fflush(stderr);
             SDL_PauseAudioDevice(b->audio_dev, 0);      // start the callback
@@ -1337,6 +1407,23 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
     if (!open_ || !impl_ || !samples || count == 0) return;
     auto* b = static_cast<Backend*>(impl_);
     if (b->audio_dev == 0) return;
+    const auto push_time = std::chrono::steady_clock::now();
+    static const bool event_probe = [] {
+        const char* e = std::getenv("GBARECOMP_EVENT_PROBE");
+        return e && e[0] == '1';
+    }();
+    if (event_probe) {
+        long long energy = 0;
+        int peak = 0;
+        for (std::size_t i = 0; i < count; ++i) {
+            const int v = samples[i];
+            energy += static_cast<long long>(v) * v;
+            peak = std::max(peak, v < 0 ? -v : v);
+        }
+        std::fprintf(stderr, "[event-probe] audio_push_ns=%lld count=%zu mean_square=%lld peak=%d\n",
+            static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                push_time.time_since_epoch()).count()), count, energy / count, peak);
+    }
 
     // Volume (launcher setting + VolumeUp/Down hotkeys): scale into scratch
     // before the bridge. 100 = passthrough, byte-identical to before.
@@ -1446,6 +1533,10 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
     rab_push(&b->bridge, samples, static_cast<int>(count)); // mono: count == frames
     SDL_UnlockMutex(b->audio_mtx);
 
+    if (b->audio_event_probe) {
+        emit_audio_pull_observations(b);
+    }
+
     // ── NES-mode crackle probe (measure step) ──────────────────────────
     // GBARECOMP_AUDIO_PROBE=1 reports the BRIDGE's underrun/overflow counters
     // (the post-fix equivalent of SDL queue underruns) so a before/after is
@@ -1456,7 +1547,12 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
         static unsigned long long s_pushes = 0, s_samples = 0;
         s_pushes++; s_samples += count;
         if ((s_pushes % 120ULL) == 0ULL) {
-            rab_stats st; rab_get_stats(&b->bridge, &st);
+            // Callback writes these fields under audio_mtx; snapshot together.
+            rab_stats st;
+            SDL_LockMutex(b->audio_mtx);
+            rab_get_stats(&b->bridge, &st);
+            const double fill_ms = rab_fill_ms(&b->bridge);
+            SDL_UnlockMutex(b->audio_mtx);
             double secs = static_cast<double>(s_samples) / 65536.0;
             double stretch_ms = st.stretch_frames * 1000.0
                               / static_cast<double>(b->bridge.cfg.host_rate);
@@ -1474,7 +1570,7 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
                 s_pushes, secs, (unsigned long long)st.underrun_events,
                 secs > 0 ? st.underrun_events / secs : 0.0,
                 stretch_ms, (unsigned long long)st.stretch_events,
-                (unsigned long long)st.overflow_drops, rab_fill_ms(&b->bridge),
+                (unsigned long long)st.overflow_drops, fill_ms,
                 st.last_correction * 100.0, gt_ms, gt_dms);
             std::fflush(stderr);
         }
@@ -1486,6 +1582,7 @@ void HostWindow::close() {
     auto* b = static_cast<Backend*>(impl_);
     b->cadence.dump();  // MC-WS-002: flush the cadence ring (verbose only)
     if (b->audio_dev) SDL_CloseAudioDevice(b->audio_dev);  // stops the callback first
+    emit_audio_pull_observations(b);
     if (b->bridge_ready) rab_free(&b->bridge);
     if (b->audio_mtx) SDL_DestroyMutex(b->audio_mtx);
     close_game_controller(b);
@@ -2071,6 +2168,18 @@ HostWindow::Events HostWindow::pump() {
         keys &= static_cast<uint16_t>(~touch_buttons);
     }
     ev.keyinput = keys;
+    // Raw host observations only: audio pushes are not causal SFX responses.
+    if (keys != b->prev_keyinput) {
+        const auto input_change_time = std::chrono::steady_clock::now();
+        const char* probe = std::getenv("GBARECOMP_EVENT_PROBE");
+        if (probe && probe[0] == '1') {
+            std::fprintf(stderr, "[event-probe] input_ns=%lld keyinput=0x%03X\n",
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    input_change_time.time_since_epoch()).count()), keys);
+            std::fflush(stderr);
+        }
+        b->prev_keyinput = keys;
+    }
 #if defined(GBARECOMP_RUNTIME_UI)
     if (b->runtime_ui && recomp_runtime_ui_is_open(b->runtime_ui))
         ev.keyinput = 0x03FFu;

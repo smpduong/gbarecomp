@@ -1765,6 +1765,142 @@ void test_obj_mosaic_stretches_sprite_blocks() {
                  "obj mosaic pixel (10,11) stretched from (10,10)");
 }
 
+
+void test_affine_bg_mosaic_stretches_blocks() {
+    Fixture f;
+    disable_all_objects(f);
+    // Mode 1, BG2 affine identity, 8bpp tile 0: px(0,0)=pal1 red,
+    // px(1,0)=pal2 green. Mosaic bit + 2x2 blocks.
+    const uint16_t dispcnt = 0x0401;
+    set_bg2_identity(f);
+    store16(&f.io[0x0C], 0x0140);  // mosaic bit, char 0, map block 1.
+    f.vram[0] = 1;
+    f.vram[1] = 2;
+    f.vram[0x800] = 0;  // map entry 0 -> tile 0 (byte map).
+    store16(&f.pal[0], 0x0000);
+    store16(&f.pal[2], 0x001F);  // red.
+    store16(&f.pal[4], 0x03E0);  // green.
+    // Control: no mosaic — adjacent pixels differ (red/green).
+    store16(&f.io[0x4C], 0x0000);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(0 * 240 + 0) * 3], 255, 0, 0,
+                 "affine mosaic control pixel (0,0)");
+    expect_pixel(&f.rgb[(0 * 240 + 1) * 3], 0, 255, 0,
+                 "affine mosaic control pixel (1,0)");
+    store16(&f.io[0x4C], 0x0011);  // BG mosaic 2x2.
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(0 * 240 + 0) * 3], 255, 0, 0,
+                 "affine mosaic pixel (0,0)");
+    expect_pixel(&f.rgb[(0 * 240 + 1) * 3], 255, 0, 0,
+                 "affine mosaic pixel (1,0) stretched from (0,0)");
+}
+
+void test_bg_mosaic_asymmetric_block_boundary() {
+    Fixture f;
+    disable_all_objects(f);
+    // Mode 0 BG0, 256-color row: px0 red, px1 green, px4 blue. Mosaic 4x2:
+    // pixels 0..3 share block origin 0; pixel 4 starts a new block.
+    const uint16_t dispcnt = 0x0100;
+    store16(&f.io[0x08], 0x01C0);
+    f.vram[0] = 1;
+    f.vram[1] = 2;
+    f.vram[4] = 3;
+    store16(&f.vram[0x800], 0);
+    store16(&f.pal[0], 0x0000);
+    store16(&f.pal[2], 0x001F);
+    store16(&f.pal[4], 0x03E0);
+    store16(&f.pal[6], 0x7C00);
+    // Control: no mosaic — pixel 1 is green, pixel 3 is transparent/black.
+    store16(&f.io[0x4C], 0x0000);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(0 * 240 + 1) * 3], 0, 255, 0,
+                 "bg mosaic 4-wide control pixel (1,0)=green");
+    store16(&f.io[0x4C], 0x0013);  // BG mosaic 4 horizontal, 2 vertical.
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(0 * 240 + 3) * 3], 255, 0, 0,
+                 "bg mosaic 4-wide pixel (3,0) still block origin");
+    expect_pixel(&f.rgb[(0 * 240 + 4) * 3], 0, 0, 255,
+                 "bg mosaic pixel (4,0) starts a new block");
+}
+
+void test_obj_mosaic_hflip_stretches_output_blocks() {
+    Fixture f;
+    disable_all_objects(f);
+    // 8x8 16-color sprite at (10,10), mosaic bit. Row 0 uses contrasting
+    // pixels: px = [red,green,blue,red,green,blue,red,green] (pal 1/2/3).
+    // GBATEK OBJ mosaic stretches OUTPUT blocks: dx shares source_x =
+    // dx - dx % mh, and hflip is applied AFTER that alignment. So a 2-wide
+    // mosaic with hflip must show pairs equal to the FLIPPED texel
+    // (px7,px5,...), while no-flip mosaic shows pairs from px0,px2,....
+    // A uniform-color row would pass with no flip and no mosaic; the
+    // contrasting row plus the controls below fail in both cases.
+    const uint16_t dispcnt = 0x1000;
+    f.vram[0x10000] = 0x21;  // px0=1 red, px1=2 green.
+    f.vram[0x10001] = 0x13;  // px2=3 blue, px3=1 red.
+    f.vram[0x10002] = 0x32;  // px4=2 green, px5=3 blue.
+    f.vram[0x10003] = 0x21;  // px6=1 red, px7=2 green.
+    store16(&f.pal[0], 0x0000);
+    store16(&f.pal[0x202], 0x001F);  // OBJ pal 1 red.
+    store16(&f.pal[0x204], 0x03E0);  // OBJ pal 2 green.
+    store16(&f.pal[0x206], 0x7C00);  // OBJ pal 3 blue.
+
+    // Control 1: no mosaic, no flip — adjacent pixels differ (red/green).
+    store16(&f.oam[0], 0x100A);  // y=10, mosaic bit (ignored, MOSAIC=0).
+    store16(&f.oam[2], 10);      // x=10, no flip.
+    store16(&f.oam[4], 0);
+    store16(&f.io[0x4C], 0x0000);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 10) * 3], 255, 0, 0,
+                 "obj mosaic hflip control noflip (10,10)=px0 red");
+    expect_pixel(&f.rgb[(10 * 240 + 11) * 3], 0, 255, 0,
+                 "obj mosaic hflip control noflip (11,10)=px1 green");
+
+    // Control 2: no mosaic, hflip — order reverses (px7 green, px6 red).
+    store16(&f.oam[2], 0x100A);  // x=10, hflip.
+    store16(&f.io[0x4C], 0x0000);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 10) * 3], 0, 255, 0,
+                 "obj mosaic hflip control flipped (10,10)=px7 green");
+    expect_pixel(&f.rgb[(10 * 240 + 11) * 3], 255, 0, 0,
+                 "obj mosaic hflip control flipped (11,10)=px6 red");
+
+    // Mosaic 2x2, no flip: pairs stretched from px0 (red) then px2 (blue).
+    store16(&f.oam[2], 10);  // no flip.
+    store16(&f.io[0x4C], 0x1100);  // OBJ mosaic 2x2.
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 10) * 3], 255, 0, 0,
+                 "obj mosaic noflip (10,10)=px0 red");
+    expect_pixel(&f.rgb[(10 * 240 + 11) * 3], 255, 0, 0,
+                 "obj mosaic noflip (11,10) stretched from px0");
+    expect_pixel(&f.rgb[(10 * 240 + 12) * 3], 0, 0, 255,
+                 "obj mosaic noflip (12,10)=px2 blue");
+    expect_pixel(&f.rgb[(10 * 240 + 13) * 3], 0, 0, 255,
+                 "obj mosaic noflip (13,10) stretched from px2");
+
+    // Mosaic 2x2, hflip: pairs stretched from flipped px7 (green) then
+    // flipped px5 (blue). Differs from no-flip at (10,10): green vs red,
+    // proving flip is honored; pairs-equal proves mosaic stretch.
+    store16(&f.oam[2], 0x100A);  // hflip.
+    store16(&f.io[0x4C], 0x1100);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 10) * 3], 0, 255, 0,
+                 "obj mosaic hflip (10,10)=flipped px7 green");
+    expect_pixel(&f.rgb[(10 * 240 + 11) * 3], 0, 255, 0,
+                 "obj mosaic hflip (11,10) stretched from flipped px7");
+    expect_pixel(&f.rgb[(10 * 240 + 12) * 3], 0, 0, 255,
+                 "obj mosaic hflip (12,10)=flipped px5 blue");
+    expect_pixel(&f.rgb[(10 * 240 + 13) * 3], 0, 0, 255,
+                 "obj mosaic hflip (13,10) stretched from flipped px5");
+}
+
 int main() {
     test_alpha_native_domain_and_green_precision();
     test_brightness_native_domain_and_green_precision();
@@ -1794,6 +1930,9 @@ int main() {
     test_latched_frame_immune_to_in_progress_scanlines();
     test_bg_mosaic_stretches_source_blocks();
     test_obj_mosaic_stretches_sprite_blocks();
+    test_affine_bg_mosaic_stretches_blocks();
+    test_bg_mosaic_asymmetric_block_boundary();
+    test_obj_mosaic_hflip_stretches_output_blocks();
     std::puts("ppu_smoke_tests: PASS");
     return 0;
 }

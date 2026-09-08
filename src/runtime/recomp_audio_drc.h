@@ -49,10 +49,9 @@ typedef struct {
     double em_low_ms;       /* below this = underrun emergency (default 12)     */
     double em_high_ms;      /* above this = overflow emergency (default 105)    */
     /* --- Phase-1 stall concealment (brief transition/startup producer stalls) --- */
-    double preroll_ms;      /* initial prime cushion; 0 => prime at target_ms.      *
-                             * A boot pre-roll hides the cold-start hitch for free   *
-                             * (latency before gameplay is irrelevant); the servo    *
-                             * drains the excess down to target over time.           */
+    double preroll_ms;      /* initial prime cushion; 0 => prime at target_ms.
+                             * Extra preroll is real queued latency; the drift servo
+                             * drains only max_correction seconds per second. */
     int    stretch_enable;  /* 1 = conceal underruns by pitch-preserving loop of the *
                              * most recent audio instead of fading to silence (1)    */
     double stretch_min_ms;  /* min loop period / correlation search floor (5)        */
@@ -273,23 +272,21 @@ void rab_push(rab_bridge *b, const int16_t *in, int frames) {
     b->stats.pushed_frames += (uint64_t)frames;
 }
 
-static void rab__update_controller(rab_bridge *b) {
+static void rab__update_controller(rab_bridge *b, int frames) {
     rab_config *c = &b->cfg;
     double fill_ms = rab_fill_ms(b);
     b->stats.last_fill_ms = fill_ms;
 
     if (!b->primed && fill_ms >= b->prime_ms) b->primed = 1;
 
-    /* one control update per pull; low-pass the normalized error. Use the pull
-     * block duration as dt (approx via host_rate is unnecessary here -- we fold
-     * the time constant into a per-update smoothing alpha sized for ~10-20ms). */
+    /* One control update per pull, using its actual host duration. A fixed
+     * 12 ms assumption changes slew/recovery with device rate and block size. */
     double err = (fill_ms - c->target_ms) / c->target_ms;
     if (fill_ms > c->target_ms - c->deadband_ms &&
         fill_ms < c->target_ms + c->deadband_ms) {
         err = 0.0; /* deadband */
     }
-    /* smoothing alpha: assume ~one update per host audio block (~10ms typical). */
-    double dt_ms = 12.0;
+    double dt_ms = frames * 1000.0 / c->host_rate;
     double alpha = dt_ms / (c->err_lp_ms + dt_ms);
     b->err_lp += alpha * (err - b->err_lp);
 
@@ -358,8 +355,9 @@ static double rab__find_loop_len(const rab_bridge *b, int64_t end_i) {
 }
 
 void rab_pull(rab_bridge *b, int16_t *out, int frames) {
+    if (frames <= 0) return;
     int ch = b->cfg.channels;
-    rab__update_controller(b);
+    rab__update_controller(b, frames);
 
     double gstep = 1.0 / (b->cfg.host_rate * 0.003); /* ~3ms fade in/out */
     double step  = b->cur_step;

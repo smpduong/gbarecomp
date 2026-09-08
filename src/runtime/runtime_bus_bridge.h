@@ -25,3 +25,11 @@ gba::GbaBus* active_bus();
 gba::GbaPpu* active_ppu();
 
 }  // namespace gbarecomp
+
+// Host-control yield gate (defined in runtime_bus_bridge.cpp, consumed by
+// runtime.cpp's runner and the frame-present tests). Host controls that
+// replace guest state must wait for a clean outer-loop boundary: User/System
+// mode with no live synchronous exception (IRQ nest depth zero).
+bool runtime_host_unwind_safe();
+void runtime_request_host_control_yield();
+void runtime_clear_host_control_yield();

@@ -898,6 +898,17 @@ std::function<bool()> g_frame_present_hook;
 // unwind (return true) so the guest's whole host call stack pops back to the
 // runner — one return only frees one frame. Cleared when a hook is (re)set.
 bool g_frame_present_quit = false;
+// Host controls that replace guest state (and pause) need a clean outer-loop
+// boundary. Keep the request pending while a synchronous exception is live.
+static bool g_host_control_yield = false;
+
+bool runtime_host_unwind_safe() {
+    const uint32_t mode = g_cpu.cpsr & 0x1Fu;
+    return g_irq_nest_depth == 0u && (mode == 0x10u || mode == 0x1Fu);
+}
+
+void runtime_request_host_control_yield() { g_host_control_yield = true; }
+void runtime_clear_host_control_yield() { g_host_control_yield = false; }
 
 // Present-in-place deliberately preserves the generated host call chain across
 // frames, but some guest script engines keep a call active for thousands of
@@ -923,6 +934,7 @@ uint32_t present_in_place_call_depth_limit() {
 void runtime_set_frame_present_hook(std::function<bool()> h) {
     g_frame_present_hook = std::move(h);
     g_frame_present_quit = false;
+    g_host_control_yield = false;
 }
 
 void runtime_set_host_service_hook(std::function<void()> h) {
@@ -961,30 +973,32 @@ extern "C" bool runtime_should_yield(void) {
         return true;
     }
 
-    // Present-in-place quit: fully unwind the guest to the runner once requested.
-    if (g_frame_present_quit) return true;
+    // An IRQ dispatcher must finish its handler before the host stack unwinds.
+    // In particular, a sticky quit inside runtime_irq's drive-to-completion loop
+    // would repeatedly return at the same PC instead of reaching its iret.
+    const bool can_unwind = runtime_host_unwind_safe();
+    if ((g_frame_present_quit || g_host_control_yield) && can_unwind) return true;
 
     bool halted = bus && bus->io().halted();
 
     // Some games, including Pokemon FireRed, busy-wait on a VBlank flag instead
-    // of entering HALT. Yield once per VBlank-start in normal guest modes so the
-    // host runner can present frames, poll input, and honor --frames even while
-    // the guest stays inside one long-running dispatch. Do NOT yield from inside
+    // of entering HALT. Service once per VBlank-start so a long dispatch cannot
+    // accumulate several unpaced frames of audio. Do NOT unwind from inside
     // an exception handler; runtime_irq runs the whole IRQ chain synchronously
     // (runtime_dispatch(0x18) between ++/-- g_irq_nest_depth), so yielding there
     // would unwind that nested dispatch and abandon the handler before it acks
     // the interrupt — the FireRed VBlank freeze. The cpsr mode alone is NOT a
     // sufficient guard: a GBA IRQ dispatcher (intr_main) switches IRQ→System mode
     // mid-handler to allow nested IRQs, so it would pass a User/System-mode test
-    // while still inside the IRQ. Gate on the live IRQ nesting depth too.
+    // while still inside the IRQ. Non-unwinding presentation is safe there;
+    // quitting, state controls, and call-depth unwinds wait for a normal mode.
     static const bool yield_on_vblank = [] {
         const char* e = std::getenv("GBARECOMP_YIELD_ON_VBLANK");
         return !(e && e[0] == '0' && e[1] == '\0');
     }();
-    if (yield_on_vblank && g_irq_nest_depth == 0u &&
+    if (yield_on_vblank &&
         g_runtime_vblank_starts != g_runtime_yielded_vblank_start) {
-        const uint32_t mode = g_cpu.cpsr & 0x1Fu;
-        if (mode == 0x10u || mode == 0x1Fu) {
+        if (g_frame_present_hook || can_unwind) {
             g_runtime_yielded_vblank_start = g_runtime_vblank_starts;
             // Present-in-place when a hook is registered (windowed runner): the
             // frame is presented from here and the guest resumes WITHOUT
@@ -992,11 +1006,32 @@ extern "C" bool runtime_should_yield(void) {
             // dispatch-miss. Only unwind (return true) when the hook asks to
             // quit. With no hook (headless/TCP), keep the original unwind path.
             if (g_frame_present_hook) {
+                static const bool protected_probe = [] {
+                    const char* e = std::getenv("GBARECOMP_PROTECTED_FRAME_PROBE");
+                    return e && e[0] && !(e[0] == '0' && e[1] == '\0');
+                }();
+                if (protected_probe && !can_unwind) {
+                    const auto* ppu = gbarecomp::g_active_ppu;
+                    const auto now = std::chrono::steady_clock::now();
+                    const auto ns = std::chrono::duration_cast<
+                        std::chrono::nanoseconds>(now.time_since_epoch()).count();
+                    std::fprintf(stderr,
+                        "[protected-frame] ns=%lld frame=%llu vblank=%llu "
+                        "vcount=%u pc=0x%08X mode=0x%02X irq_depth=%u "
+                        "cycles=%llu\n",
+                        static_cast<long long>(ns),
+                        ppu ? static_cast<unsigned long long>(ppu->frame_count()) : 0ull,
+                        g_runtime_vblank_starts,
+                        ppu ? static_cast<unsigned>(ppu->vcount()) : 0u,
+                        g_cpu.R[15], g_cpu.cpsr & 0x1Fu, g_irq_nest_depth,
+                        g_runtime_cycles);
+                }
                 bool quit = g_frame_present_hook();
                 if (quit) {
-                    g_frame_present_quit = true;  // sticky: full unwind
-                    return true;
+                    g_frame_present_quit = true;  // pending until safe to unwind
                 }
+                if (!can_unwind) return false;
+                if (g_frame_present_quit || g_host_control_yield) return true;
                 const uint32_t call_depth = runtime_call_stack_depth();
                 const uint32_t call_depth_limit =
                     present_in_place_call_depth_limit();
