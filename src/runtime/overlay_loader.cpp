@@ -3,6 +3,7 @@
 #include "overlay_loader.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -325,6 +326,23 @@ void worker_main() {
         ReadyEntry r;
         r.key = heal_key(w.pc, w.thumb);
         std::string err;
+        if (w.load_only) {
+            // Background preload: load the cached artifact if present, never
+            // compile. A failure (evicted/stale file) is swallowed silently —
+            // a later real miss for this PC compiles fresh, and must NOT see
+            // a poisoned s_failed entry from preload.
+            const std::string& dir =
+                w.cache_dir.empty() ? s_active_cache_dir : w.cache_dir;
+            r.ok = overlay_compile_one(w, dir, &g_callbacks,
+                                       /*compile_if_missing=*/false, s_backend,
+                                       &r.c, &err);
+            if (r.ok) {
+                std::lock_guard<std::mutex> lk(s_ready_mtx);
+                s_ready.push_back(r);
+                s_ready_pending.fetch_add(1, std::memory_order_release);
+            }
+            continue;
+        }
         r.ok = overlay_compile_one(w, s_active_cache_dir, &g_callbacks,
                                    /*compile_if_missing=*/true, s_backend,
                                    &r.c, &err);
@@ -349,16 +367,20 @@ void worker_main() {
     }
 }
 
-// Warm-load every cached DLL in `dir` (load-only: never compiles at startup).
-// Filenames are "<pc:08X>_<crc:08X>_<a|t>.dll"; we recover (pc, mode) and let
-// overlay_compile_one re-derive the extent + validate the CRC. `seen` dedups
-// across the gcc and tcc namespaces so the higher-priority one (scanned first)
-// wins — consumption is producer-blind.
-int warm_load_cache_dir(const std::string& dir, HealBackend backend,
-                        std::unordered_set<uint64_t>& seen) {
+// Enqueue every cached DLL in `dir` for BACKGROUND load (load-only: never
+// compiles at startup). Filenames are "<pc:08X>_<crc:08X>_<a|t>.dll"; we
+// recover (pc, mode) + immutable region bytes here (cheap readdir work on the
+// init thread) and let the worker thread do the expensive part (extent
+// re-derivation, CRC validation, dlopen). Results install into g_healed at
+// frame boundaries via the normal ready-queue drain, so startup no longer
+// blocks on thousands of dlopens. `seen` dedups across the gcc and tcc
+// namespaces so the higher-priority one (scanned first) wins — consumption
+// is producer-blind.
+int warm_enqueue_cache_dir(const std::string& dir,
+                           std::unordered_set<uint64_t>& seen) {
     std::error_code ec;
     if (!fs::exists(dir, ec)) return 0;
-    int loaded = 0;
+    int queued = 0;
     for (const auto& de : fs::directory_iterator(dir, ec)) {
         if (ec) break;
         if (!de.is_regular_file()) continue;
@@ -378,28 +400,27 @@ int warm_load_cache_dir(const std::string& dir, HealBackend backend,
         w.pc = pc;
         w.thumb = thumb;
         if (!region_bytes(pc, &w.bytes, &w.size, &w.base)) continue;
-
-        OverlayCompiled c;
-        std::string err;
-        if (overlay_compile_one(w, dir, &g_callbacks,
-                                /*compile_if_missing=*/false, backend, &c, &err)) {
-            install_healed(key, c);
-            ++loaded;
+        w.load_only = true;
+        w.cache_dir = dir;
+        {
+            std::lock_guard<std::mutex> lk(s_work_mtx);
+            s_work.push_back(std::move(w));
         }
+        ++queued;
     }
-    return loaded;
+    s_work_cv.notify_all();
+    return queued;
 }
 
-// Warm-load both producer namespaces, gcc first so a shipped gcc DLL supersedes
-// a player's local tcc shard for the same function (gcc > tcc consumption).
-int warm_load_cache() {
+// Enqueue both producer namespaces for background load, gcc first so a
+// shipped gcc DLL supersedes a player's local tcc shard for the same
+// function (gcc > tcc consumption).
+int warm_enqueue_cache() {
     std::unordered_set<uint64_t> seen;
-    int loaded = 0;
-    loaded += warm_load_cache_dir(cache_dir_for(HealBackend::Gcc),
-                                  HealBackend::Gcc, seen);
-    loaded += warm_load_cache_dir(cache_dir_for(HealBackend::Tcc),
-                                  HealBackend::Tcc, seen);
-    return loaded;
+    int queued = 0;
+    queued += warm_enqueue_cache_dir(cache_dir_for(HealBackend::Gcc), seen);
+    queued += warm_enqueue_cache_dir(cache_dir_for(HealBackend::Tcc), seen);
+    return queued;
 }
 
 }  // namespace
@@ -467,11 +488,28 @@ void overlay_loader_init(const std::string& cache_root,
     s_active = true;
     s_ever_active = true;  // sticky: survives shutdown for the exit report
 
-    int warm = warm_load_cache();
+    // Start the worker first: cache preload runs on it (background), so
+    // startup no longer blocks on thousands of dlopens. Preloaded entries
+    // install at frame boundaries via the normal ready-queue drain; gaps
+    // bridge through the interpreter exactly like uncached misses.
     s_stop.store(false);
     s_worker = std::thread(worker_main);
 
-    std::printf("self_heal_recompile=ENABLED backend=%s cache=\"%s\" warm_loaded=%d\n",
+    // Diagnostic bypass preserves the cache and keeps on-demand healing active.
+    const char* warm_env = std::getenv("GBARECOMP_HEAL_WARM_LOAD");
+    const bool warm_enabled = !(warm_env && std::strcmp(warm_env, "0") == 0);
+    const auto warm_start = std::chrono::steady_clock::now();
+    int warm = 0;
+    if (warm_enabled) {
+        warm = warm_enqueue_cache();
+        std::fprintf(stderr, "self_heal: cache preload queued entries=%d elapsed_ms=%lld (background)\n",
+                     warm, static_cast<long long>(std::chrono::duration_cast<
+                         std::chrono::milliseconds>(std::chrono::steady_clock::now() - warm_start).count()));
+    } else {
+        std::fprintf(stderr, "self_heal: cache preload bypassed (GBARECOMP_HEAL_WARM_LOAD=0)\n");
+    }
+
+    std::printf("self_heal_recompile=ENABLED backend=%s cache=\"%s\" preload_queued=%d\n",
                 heal_backend_name(s_backend), s_active_cache_dir.c_str(), warm);
 }
 

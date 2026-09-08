@@ -48,6 +48,12 @@ struct OverlayWorkItem {
     std::size_t    size  = 0;
     uint32_t       base  = 0;
     std::vector<uint8_t> owned_bytes;
+    // Background preload: load the cached artifact if present, never compile,
+    // and never poison s_failed on a miss (a later real miss compiles fresh).
+    bool           load_only = false;
+    // Namespace dir to load from (preload may span gcc+tcc namespaces);
+    // empty means the active backend dir (miss path).
+    std::string    cache_dir;
 };
 
 // The result of a successful compile-or-load.
