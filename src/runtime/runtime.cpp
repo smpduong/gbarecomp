@@ -3257,14 +3257,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 last_presented_frame = frame;
                 if (present_frame) {
                     ++frames_presented;
-                    if (args.frames >= 0 && frames_presented >= args.frames) {
+                    if (args.frames >= 0 && frames_presented >= args.frames)
                         host_quit = true;
-                        frame_phase.dump();
-                    }
                     if (pacer) pacer->wait_for_next_frame();
                 }
                 frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3, fp_t4,
                                    FramePhaseRing::now_ns());
+                // Dump after recording so the limit-triggered CSV retains the
+                // final presented frame even if the exit-path dump never runs.
+                // The graceful-exit dump below rewrites the same file.
+                if (present_frame && args.frames >= 0 &&
+                    frames_presented >= args.frames)
+                    frame_phase.dump();
 
             }
             in_frame_present_hook = false;
@@ -3642,10 +3646,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 last_presented_frame = frame;
                 if (present_frame) {
                     ++frames_presented;
-                    if (args.frames >= 0 && frames_presented >= args.frames) {
+                    if (args.frames >= 0 && frames_presented >= args.frames)
                         host_quit = true;
-                        frame_phase.dump();
-                    }
                     // Normal play presents/paces every frame. Fast-forward
                     // runs N guest frames per one paced host presentation,
                     // making its selected multiplier independent of monitor Hz.
@@ -3653,6 +3655,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 }
                 frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3, fp_t4,
                                    FramePhaseRing::now_ns());
+                // Dump after recording so the limit-triggered CSV retains the
+                // final presented frame even if the exit-path dump never runs.
+                if (present_frame && args.frames >= 0 &&
+                    frames_presented >= args.frames)
+                    frame_phase.dump();
             }
         }
         // Differential-oracle WRAM trace fires on frame advance in BOTH windowed
