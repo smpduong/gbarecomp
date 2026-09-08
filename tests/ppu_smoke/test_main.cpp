@@ -1693,6 +1693,78 @@ void test_latched_frame_immune_to_in_progress_scanlines() {
 
 } // namespace
 
+
+void test_bg_mosaic_stretches_source_blocks() {
+    Fixture f;
+    disable_all_objects(f);
+    // Mode 0 BG0, 256-color tile 0 at character base 0, map at 0x800.
+    // Pixels (0,0)=pal1 red, (1,0)=pal2 green; rest transparent.
+    const uint16_t dispcnt = 0x0100;
+    store16(&f.io[0x08], 0x01C0);  // 256 colors, mosaic bit, map block 1.
+    f.vram[0] = 1;
+    f.vram[1] = 2;
+    store16(&f.vram[0x800], 0);
+    store16(&f.pal[0], 0x0000);  // backdrop black.
+    store16(&f.pal[2], 0x001F);  // red.
+    store16(&f.pal[4], 0x03E0);  // green.
+
+    // Control first: no mosaic, adjacent pixels differ.
+    store16(&f.io[0x4C], 0x0000);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(0 * 240 + 0) * 3], 255, 0, 0,
+                 "bg mosaic control pixel (0,0)");
+    expect_pixel(&f.rgb[(0 * 240 + 1) * 3], 0, 255, 0,
+                 "bg mosaic control pixel (1,0)");
+
+    // BG mosaic 2x2: pixel (1,0) must sample block origin (0,0).
+    store16(&f.io[0x4C], 0x0011);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(0 * 240 + 0) * 3], 255, 0, 0,
+                 "bg mosaic pixel (0,0)");
+    expect_pixel(&f.rgb[(0 * 240 + 1) * 3], 255, 0, 0,
+                 "bg mosaic pixel (1,0) stretched from (0,0)");
+    expect_pixel(&f.rgb[(1 * 240 + 0) * 3], 255, 0, 0,
+                 "bg mosaic pixel (0,1) stretched from (0,0)");
+}
+
+void test_obj_mosaic_stretches_sprite_blocks() {
+    Fixture f;
+    disable_all_objects(f);
+    // Mode 0, OBJ layer only. 8x8 16-color sprite at (10,10), mosaic bit.
+    // Tile pixel (0,0)=pal1 red, (1,0)=pal2 green.
+    const uint16_t dispcnt = 0x1000;
+    store16(&f.oam[0], 0x100A);  // y=10, mosaic.
+    store16(&f.oam[2], 10);      // x=10.
+    store16(&f.oam[4], 0);       // tile 0.
+    f.vram[0x10000] = 0x21;  // row 0: px0 red, px1 green.
+    f.vram[0x10004] = 0x22;  // row 1: green (keeps the control opaque).
+    store16(&f.pal[0], 0x0000);     // backdrop black.
+    store16(&f.pal[0x202], 0x001F);  // OBJ pal 1 red.
+    store16(&f.pal[0x204], 0x03E0);  // OBJ pal 2 green.
+
+    // Control first: no mosaic, adjacent pixels differ.
+    store16(&f.io[0x4C], 0x0000);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 10) * 3], 255, 0, 0,
+                 "obj mosaic control pixel (10,10)");
+    expect_pixel(&f.rgb[(10 * 240 + 11) * 3], 0, 255, 0,
+                 "obj mosaic control pixel (11,10)");
+
+    // OBJ mosaic 2x2: pixel (11,10) must sample block origin (10,10).
+    store16(&f.io[0x4C], 0x1100);
+    f.ppu.render(f.rgb.data(), dispcnt, f.io.data(), f.vram.data(),
+                 f.oam.data(), f.pal.data());
+    expect_pixel(&f.rgb[(10 * 240 + 10) * 3], 255, 0, 0,
+                 "obj mosaic pixel (10,10)");
+    expect_pixel(&f.rgb[(10 * 240 + 11) * 3], 255, 0, 0,
+                 "obj mosaic pixel (11,10) stretched from (10,10)");
+    expect_pixel(&f.rgb[(11 * 240 + 10) * 3], 255, 0, 0,
+                 "obj mosaic pixel (10,11) stretched from (10,10)");
+}
+
 int main() {
     test_alpha_native_domain_and_green_precision();
     test_brightness_native_domain_and_green_precision();
@@ -1720,6 +1792,8 @@ int main() {
     test_affine_reference_reload_overrides_scanline_accumulation();
     test_wide_affine_filter_is_selective_and_bilinear();
     test_latched_frame_immune_to_in_progress_scanlines();
+    test_bg_mosaic_stretches_source_blocks();
+    test_obj_mosaic_stretches_sprite_blocks();
     std::puts("ppu_smoke_tests: PASS");
     return 0;
 }

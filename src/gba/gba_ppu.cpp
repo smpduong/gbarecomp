@@ -855,6 +855,10 @@ void render_scanline_internal(uint8_t* rgb,
         bool color256 = (bgcnt & 0x0080u) != 0;
         uint32_t size_code = (bgcnt >> 14) & 0x3u;
         uint32_t bg_priority = bgcnt & 0x3u;
+        // GBATEK MOSAIC (0x400004C): when BGxCNT bit 6 is set, each source
+        // pixel stretches over an (h+1)x(v+1) screen block; fetch from the
+        // block origin so the whole block shares one texel.
+        const bool bg_mosaic = (bgcnt & 0x0040u) != 0;
         uint32_t hofs = static_cast<uint16_t>(
             io[scroll_off] | (io[scroll_off + 1] << 8)) & 0x01FFu;
         uint32_t vofs = static_cast<uint16_t>(
@@ -866,10 +870,17 @@ void render_scanline_internal(uint8_t* rgb,
         uint32_t height_px = height_tiles * 8u;
         uint32_t block_cols = width_tiles / 32u;
 
+        uint16_t mos = static_cast<uint16_t>(
+            io[0x4C] | (io[0x4D] << 8));
+        uint32_t mos_h = (mos & 15u) + 1u;
+        uint32_t mos_v = ((mos >> 4) & 15u) + 1u;
+
         for (uint32_t x = 0; x < kScreenWidth; ++x) {
             if (!layer_enabled(x, layer)) continue;
-            uint32_t tex_x = (x + hofs) & (width_px - 1u);
-            uint32_t tex_y = (y + vofs) & (height_px - 1u);
+            uint32_t mx = bg_mosaic ? x - x % mos_h : x;
+            uint32_t my = bg_mosaic ? y - y % mos_v : y;
+            uint32_t tex_x = (mx + hofs) & (width_px - 1u);
+            uint32_t tex_y = (my + vofs) & (height_px - 1u);
             uint32_t tile_x = tex_x >> 3;
             uint32_t tile_y = tex_y >> 3;
             uint32_t block = (tile_x >> 5) + (tile_y >> 5) * block_cols;
@@ -938,6 +949,13 @@ void render_scanline_internal(uint8_t* rgb,
         int bg_pixels = 128 << size_code;
         int bg_tiles  = bg_pixels / 8;
         int bg_priority = static_cast<int>(bgcnt & 0x3u);
+        // GBATEK MOSAIC: BGxCNT bit 6 (all BG types). Evaluate the affine
+        // transform at the mosaic block origin so blocks share one texel.
+        const bool bg_mosaic = (bgcnt & 0x0040u) != 0;
+        uint16_t aff_mos = static_cast<uint16_t>(
+            io[0x4C] | (io[0x4D] << 8));
+        int32_t aff_mh = static_cast<int32_t>((aff_mos & 15u) + 1u);
+        int32_t aff_mv = static_cast<int32_t>(((aff_mos >> 4) & 15u) + 1u);
 
         int32_t pa = read_s16(io, param_off + 0x00);
         int32_t pb = read_s16(io, param_off + 0x02);
@@ -948,8 +966,18 @@ void render_scanline_internal(uint8_t* rgb,
         int32_t xt = refx + static_cast<int32_t>(y) * pb;
         int32_t yt = refy + static_cast<int32_t>(y) * pd;
         for (uint32_t x = 0; x < kScreenWidth; ++x) {
-            int32_t tex_x = xt >> 8;
-            int32_t tex_y = yt >> 8;
+            int32_t tex_x, tex_y;
+            if (bg_mosaic) {
+                int32_t mx = static_cast<int32_t>(x) -
+                    static_cast<int32_t>(x) % aff_mh;
+                int32_t my = static_cast<int32_t>(y) -
+                    static_cast<int32_t>(y) % aff_mv;
+                tex_x = (refx + my * pb + mx * pa) >> 8;
+                tex_y = (refy + my * pd + mx * pc) >> 8;
+            } else {
+                tex_x = xt >> 8;
+                tex_y = yt >> 8;
+            }
             xt += pa;
             yt += pc;
             if (!layer_enabled(x, layer)) continue;
@@ -999,6 +1027,12 @@ void render_scanline_internal(uint8_t* rgb,
         constexpr uint32_t layer = 2;
         uint16_t bgcnt = static_cast<uint16_t>(io[0x0C] | (io[0x0D] << 8));
         int bg_priority = static_cast<int>(bgcnt & 0x3u);
+        // GBATEK MOSAIC: BG2 bit 6; same block-origin rule.
+        const bool bg_mosaic = (bgcnt & 0x0040u) != 0;
+        uint16_t bmp_mos = static_cast<uint16_t>(
+            io[0x4C] | (io[0x4D] << 8));
+        int32_t bmp_mh = static_cast<int32_t>((bmp_mos & 15u) + 1u);
+        int32_t bmp_mv = static_cast<int32_t>(((bmp_mos >> 4) & 15u) + 1u);
 
         const bool     direct = (bg_mode != 4);
         const int      bmp_w  = (bg_mode == 5) ? 160 : 240;
@@ -1016,8 +1050,18 @@ void render_scanline_internal(uint8_t* rgb,
         int32_t xt = refx + static_cast<int32_t>(y) * pb;
         int32_t yt = refy + static_cast<int32_t>(y) * pd;
         for (uint32_t x = 0; x < kScreenWidth; ++x) {
-            int32_t tex_x = xt >> 8;
-            int32_t tex_y = yt >> 8;
+            int32_t tex_x, tex_y;
+            if (bg_mosaic) {
+                int32_t mx = static_cast<int32_t>(x) -
+                    static_cast<int32_t>(x) % bmp_mh;
+                int32_t my = static_cast<int32_t>(y) -
+                    static_cast<int32_t>(y) % bmp_mv;
+                tex_x = (refx + my * pb + mx * pa) >> 8;
+                tex_y = (refy + my * pd + mx * pc) >> 8;
+            } else {
+                tex_x = xt >> 8;
+                tex_y = yt >> 8;
+            }
             xt += pa;
             yt += pc;
             if (!layer_enabled(x, layer)) continue;
@@ -1225,6 +1269,13 @@ void render_scanline_internal(uint8_t* rgb,
                 if (apply_foreign_obj_focus(&sx, &sy, bw, bh, tile_num,
                                             false, static_cast<uint32_t>(idx)).action ==
                     ForeignObjFocusAction::kSuppress) continue;
+                // GBATEK MOSAIC sizes for this sprite (identity when off).
+                uint16_t rot_omos = static_cast<uint16_t>(
+                    io[0x4C] | (io[0x4D] << 8));
+                const int obj_mh = ((attr0 & 0x1000u) != 0) ?
+                    ((rot_omos >> 8) & 15) + 1 : 1;
+                const int obj_mv = ((attr0 & 0x1000u) != 0) ?
+                    ((rot_omos >> 12) & 15) + 1 : 1;
                 int j = static_cast<int>(y) - sy;
                 if (j < 0 || j >= bh) continue;
                 int affine_group = (attr1 >> 9) & 0x1Fu;
@@ -1238,8 +1289,13 @@ void render_scanline_internal(uint8_t* rgb,
                 int half_sw = sw >> 1;
                 int half_sh = sh >> 1;
                 int dy = j - half_bh;
+                // GBATEK MOSAIC on rot/scale sprites: truncate the sprite-
+                // space raster coords so blocks share one texel.
+                int mdy = j - j % obj_mv;
                 for (int i = 0; i < bw; ++i) {
-                    int dx = i - half_bw;
+                    int mdx = i - i % obj_mh;
+                    int dx = mdx - half_bw;
+                    int dy = mdy - half_bh;
                     int tex_x = ((pa * dx + pb * dy) >> 8) + half_sw;
                     int tex_y = ((pc * dx + pd * dy) >> 8) + half_sh;
                     if (tex_x < 0 || tex_x >= sw) continue;
@@ -1256,6 +1312,14 @@ void render_scanline_internal(uint8_t* rgb,
             const int draw_h = scaled_extent(sh, focus_result.scale_q8_8);
             int line = static_cast<int>(y) - sy;
             if (line < 0 || line >= draw_h) continue;
+            // GBATEK MOSAIC (OBJ bit, ATTR0 bit 12): stretch source
+            // pixels over origin-aligned blocks of the sprite surface.
+            const bool obj_mosaic = (attr0 & 0x1000u) != 0;
+            uint16_t obj_mos = static_cast<uint16_t>(
+                io[0x4C] | (io[0x4D] << 8));
+            const int obj_mh = obj_mosaic ? ((obj_mos >> 8) & 15) + 1 : 1;
+            const int obj_mv = obj_mosaic ? ((obj_mos >> 12) & 15) + 1 : 1;
+            line -= line % obj_mv;
             bool hflip = (attr1 & 0x1000u) != 0;
             bool vflip = (attr1 & 0x2000u) != 0;
             const int source_y = nearest_source_pixel(line, sh, draw_h);
@@ -1264,7 +1328,7 @@ void render_scanline_internal(uint8_t* rgb,
             int src_ty = vflip ? (tiles_h - 1 - ty) : ty;
             int src_py = vflip ? (7 - py) : py;
             for (int dx = 0; dx < draw_w; ++dx) {
-                const int source_x = nearest_source_pixel(dx, sw, draw_w);
+                const int source_x = nearest_source_pixel(dx - dx % obj_mh, sw, draw_w);
                 const int tx = source_x >> 3;
                 int src_tx = hflip ? (tiles_w - 1 - tx) : tx;
                 const int px = source_x & 7;
@@ -1935,6 +1999,14 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             const int draw_h = scaled_extent(sh, focus_result.scale_q8_8);
             int line = static_cast<int>(y) - sy;
             if (line < 0 || line >= draw_h) continue;
+            // GBATEK MOSAIC (OBJ bit, ATTR0 bit 12): stretch source
+            // pixels over origin-aligned blocks of the sprite surface.
+            const bool obj_mosaic = (attr0 & 0x1000u) != 0;
+            uint16_t obj_mos = static_cast<uint16_t>(
+                io[0x4C] | (io[0x4D] << 8));
+            const int obj_mh = obj_mosaic ? ((obj_mos >> 8) & 15) + 1 : 1;
+            const int obj_mv = obj_mosaic ? ((obj_mos >> 12) & 15) + 1 : 1;
+            line -= line % obj_mv;
             if (!obj_focus_active) resolve_sx();
             bool hflip = (attr1 & 0x1000u) != 0;
             bool vflip = (attr1 & 0x2000u) != 0;
@@ -1944,7 +2016,7 @@ void render_scanline_wide(uint8_t* rgb, uint32_t y, uint16_t dispcnt,
             int src_ty = vflip ? (tiles_h - 1 - ty) : ty;
             int src_py = vflip ? (7 - py) : py;
             for (int dx = 0; dx < draw_w; ++dx) {
-                const int source_x = nearest_source_pixel(dx, sw, draw_w);
+                const int source_x = nearest_source_pixel(dx - dx % obj_mh, sw, draw_w);
                 const int tx = source_x >> 3;
                 int src_tx = hflip ? (tiles_w - 1 - tx) : tx;
                 const int px = source_x & 7;
