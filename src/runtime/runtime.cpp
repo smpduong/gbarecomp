@@ -30,6 +30,7 @@
 #include "gba_rom_header.h"
 #include "host_platform.h"
 #include "host_window.h"
+#include "input_replay.h"
 #include "runtime_arm.h"
 #include "runtime_bus_bridge.h"
 #include "save_config.h"
@@ -2009,6 +2010,32 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                                  std::string& e) -> bool {
         return debug::save_state(path.c_str(), make_snapshot_ctx(), &e);
     };
+    // Short integrity digest of guest CPU/memory state for host-control log
+    // lines: lets an offline harness assert that a host-queue load restored
+    // the exact state a host-queue save recorded (pc + frame + all five
+    // memory regions). FNV-1a, game thread only, <1 ms for ~384 KB.
+    auto guest_state_digest = [&]() -> std::string {
+        uint64_t h = 1469598103934665603ull;
+        auto fold = [&](const uint8_t* p, std::size_t n) {
+            for (std::size_t i = 0; i < n; ++i) {
+                h ^= p[i];
+                h *= 1099511628211ull;
+            }
+        };
+        fold(bus.iwram_ptr(), 32 * 1024);
+        fold(bus.ewram_ptr(), 256 * 1024);
+        fold(bus.vram_ptr(), 96 * 1024);
+        fold(bus.pal_ptr(), 1024);
+        fold(bus.oam_ptr(), 1024);
+        for (int i = 0; i < 16; ++i) {
+            const uint32_t r = g_cpu.R[i];
+            fold(reinterpret_cast<const uint8_t*>(&r), sizeof(r));
+        }
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016llx",
+                      static_cast<unsigned long long>(h));
+        return std::string(buf);
+    };
     auto do_savestate_load = [&](const std::string& path,
                                  std::string& e) -> bool {
         if (!debug::load_state(path.c_str(), make_snapshot_ctx(), &e)) {
@@ -2312,6 +2339,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         uint32_t pump_us = 0;
         uint32_t pacer_us = 0;
         uint32_t compile_us = 0;  // overlay game-thread compile this frame
+        // Presentation-boundary + healing-activity attribution (see record):
+        uint64_t present_ns = 0;   // monotonic ns just after win.present
+                                   // returned; 0 when this row presented
+                                   // nothing (fast-forward skip)
+        uint64_t interp_delta = 0;  // interpreter-bridged insns this cycle
+        uint32_t worker_delta_us = 0;  // worker time in overlay_compile_one
     };
     struct FramePhaseRing {
         enum : int { kSize = 16384 };  // local class: no static data members
@@ -2319,6 +2352,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         uint64_t total = 0;
         uint64_t prev_exit_ns = 0;
         unsigned long long prev_compile_ns = 0;
+        unsigned long long prev_interp_insns = 0;
+        unsigned long long prev_worker_busy_ns = 0;
         static uint64_t now_ns() {
             return static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2329,7 +2364,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             return b > a ? static_cast<uint32_t>((b - a) / 1000ull) : 0u;
         }
         void record(uint64_t frame, uint64_t t0, uint64_t t1, uint64_t t2,
-                    uint64_t t3, uint64_t t4, uint64_t t5) {
+                    uint64_t t3, uint64_t t4, uint64_t t5,
+                    uint64_t present_boundary_ns) {
             if (ring.empty()) ring.resize(kSize);
             FramePhaseSample s;
             s.frame = frame;
@@ -2343,6 +2379,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             s.compile_us = static_cast<uint32_t>(
                 (cc - prev_compile_ns) / 1000ull);
             prev_compile_ns = cc;
+            // Attribution: interpreter bridging + background-worker healing
+            // during this frame cycle. compile_us above is always 0 (the
+            // game thread never compiles); these two deltas are where cold-
+            // start healing activity actually shows up.
+            const unsigned long long ii = self_heal_interpreted_insns();
+            s.interp_delta = ii - prev_interp_insns;
+            prev_interp_insns = ii;
+            const unsigned long long wb = overlay_worker_busy_ns();
+            s.worker_delta_us = static_cast<uint32_t>(
+                (wb - prev_worker_busy_ns) / 1000ull);
+            prev_worker_busy_ns = wb;
+            s.present_ns = present_boundary_ns;
             prev_exit_ns = t5;
             ring[total % kSize] = s;
             ++total;
@@ -2352,15 +2400,26 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             if (!p || !*p || total == 0) return;
             std::FILE* f = std::fopen(p, "w");
             if (!f) return;
+            // NOTE on semantics: the per-row phase durations tile ONE frame
+            // cycle (guest resume -> cycle exit), NOT one physical display
+            // scanout. present_ns is the monotonic host timestamp just after
+            // win.present returned; consecutive differences are HOST
+            // presentation-boundary intervals, not display scanout timing.
+            // Frame IDs may step backward across a save load/rewind while
+            // present_ns stays monotonic.
             std::fprintf(f, "frame,guest_us,render_us,present_us,audio_us,"
-                            "pump_us,pacer_us,compile_us\n");
+                            "pump_us,pacer_us,compile_us,present_ns,"
+                            "interp_delta,worker_delta_us\n");
             const uint64_t n = std::min<uint64_t>(total, kSize);
             for (uint64_t i = 0; i < n; ++i) {
                 const FramePhaseSample& s = ring[(total - n + i) % kSize];
-                std::fprintf(f, "%llu,%u,%u,%u,%u,%u,%u,%u\n",
+                std::fprintf(f, "%llu,%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%u\n",
                     static_cast<unsigned long long>(s.frame), s.guest_us,
                     s.render_us, s.present_us, s.audio_us, s.pump_us,
-                    s.pacer_us, s.compile_us);
+                    s.pacer_us, s.compile_us,
+                    static_cast<unsigned long long>(s.present_ns),
+                    static_cast<unsigned long long>(s.interp_delta),
+                    s.worker_delta_us);
             }
             std::fclose(f);
             std::fprintf(stderr, "[frame-phase] dumped %llu frames -> %s\n",
@@ -2730,11 +2789,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // every observed key-state change and flushes it immediately; strict
     // acceptance can replay the frame-indexed trace from the same initial
     // SRAM. The trace is input evidence only and never reads or steers guest
-    // state.
-    struct InputTraceEvent {
-        uint64_t frame = 0;
-        uint16_t keyinput = 0x03FFu;
-    };
+    // state. Lookup semantics live in input_replay.h (unit-tested).
     const char* input_record_env = std::getenv("GBARECOMP_INPUT_RECORD");
     const char* input_replay_env = std::getenv("GBARECOMP_INPUT_REPLAY");
     const bool input_record_requested = input_record_env && input_record_env[0];
@@ -2767,7 +2822,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             std::printf("input_record=ENABLED path=\"%s\"\n", input_record_env);
     }
 
-    std::vector<InputTraceEvent> input_replay_events;
+    std::vector<InputReplayEvent> input_replay_events;
     if (input_replay_requested) {
         std::ifstream replay(input_replay_env);
         if (!replay) {
@@ -2818,6 +2873,29 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     }();
     uint16_t last_applied_keyinput = 0xFFFFu;
     unsigned long long input_apply_epoch = g_runtime_state_epoch;
+    // Per-frame applied-input record (GBARECOMP_INPUT_APPLY_LOG=<path>): one
+    // "frame,0xKEYS" row per guest frame, written when the replay applies.
+    // Lets an offline harness assert the ACTUAL guest KEYINPUT against an
+    // independently computed expectation for every frame — including frames
+    // revisited by a load/rewind (rows repeat across restores by design).
+    // Buffered stdio, flushed at shutdown; never written from the audio
+    // callback or any real-time path.
+    std::FILE* input_apply_log = nullptr;
+    uint64_t input_apply_log_frame = UINT64_MAX;
+    if (const char* p = std::getenv("GBARECOMP_INPUT_APPLY_LOG")) {
+        if (p[0] && input_replay_requested) {
+            input_apply_log = std::fopen(p, "w");
+            if (input_apply_log) {
+                std::fprintf(input_apply_log,
+                             "# frame,keyinput_active_low\n");
+            } else {
+                std::fprintf(stderr,
+                             "[gbarecomp:runtime] could not create input "
+                             "apply log %s\n",
+                             p);
+            }
+        }
+    }
     auto apply_guest_keyinput = [&](uint16_t keys) {
         // A restore can reinstate a different KEYINPUT value even when the
         // next sampled host/replay input equals the pre-restore value. Establish
@@ -2842,14 +2920,22 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     auto apply_input_replay = [&]() {
         if (!input_replay_requested) return;
         const uint64_t frame = ppu.frame_count();
-        // A save load or rewind can move guest time in either direction. Seek
-        // from the frame itself rather than retaining a forward-only cursor.
-        // upper_bound also preserves the last-event-wins rule for equal frames.
-        const auto next = std::upper_bound(
-            input_replay_events.begin(), input_replay_events.end(), frame,
-            [](uint64_t f, const InputTraceEvent& event) { return f < event.frame; });
-        apply_guest_keyinput(next == input_replay_events.begin()
-            ? 0x03FFu : (next - 1)->keyinput);
+        // Seek from the frame itself (never a forward-only cursor) with
+        // last-event-wins for equal frames — see input_replay.h, which is
+        // unit-tested including the failure modes of the alternatives.
+        apply_guest_keyinput(
+            replay_keyinput_at(input_replay_events, frame));
+        if (input_apply_log && frame != input_apply_log_frame) {
+            input_apply_log_frame = frame;
+            const uint16_t keys =
+                replay_keyinput_at(input_replay_events, frame);
+            std::fprintf(input_apply_log, "%llu,0x%04X\n",
+                         static_cast<unsigned long long>(frame),
+                         static_cast<unsigned>(keys));
+            // Flush per row: the log must survive even a forced kill, and a
+            // few hundred rows are negligible I/O.
+            std::fflush(input_apply_log);
+        }
     };
 
     // Optional monotonic-pump Assist action script for automated validation.
@@ -2857,7 +2943,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // as HostWindow input without depending on desktop focus or synthetic OS
     // modifier state. Format:
     //   GBARECOMP_ASSIST_SCRIPT="1:fast_on;600:fast_off;620:save1;"
-    //                           "700:load1;800:rewind"
+    //                           "700:load1;800:rewind;900:pause;950:resume"
+    // pause/resume are state-checked (a pause while paused is a no-op), so
+    // pause;pause;resume stays paused until resume.
     // Pump indices never move backward when a state is loaded, so a script
     // cannot accidentally replay earlier actions after a restore.
     enum class AssistScriptAction {
@@ -2866,6 +2954,8 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         Save,
         Load,
         Rewind,
+        Pause,
+        Resume,
     };
     struct AssistScriptEvent {
         uint64_t pump = 0;
@@ -2906,6 +2996,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 event.action = AssistScriptAction::FastOff;
             } else if (action == "rewind") {
                 event.action = AssistScriptAction::Rewind;
+            } else if (action == "pause") {
+                event.action = AssistScriptAction::Pause;
+            } else if (action == "resume") {
+                event.action = AssistScriptAction::Resume;
             } else if (action.rfind("save", 0) == 0 ||
                        action.rfind("load", 0) == 0) {
                 const bool save = action.rfind("save", 0) == 0;
@@ -2978,6 +3072,15 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     break;
                 case AssistScriptAction::Rewind:
                     ev.rewind = true;
+                    break;
+                case AssistScriptAction::Pause:
+                    // State-checked like a player holding the pause hotkey
+                    // with intent: only request the transition that changes
+                    // state, so pause;pause;resume stays paused until resume.
+                    if (!host_paused) ev.toggle_pause = true;
+                    break;
+                case AssistScriptAction::Resume:
+                    if (host_paused) ev.toggle_pause = true;
                     break;
             }
             std::printf("assist_script_event pump=%llu action=%s\n",
@@ -3102,13 +3205,28 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             if (ev.toggle_pause) {
                 host_paused = !host_paused;
                 if (!host_paused && pacer) pacer->reset();
+                // Ordered, valued pause evidence for offline harnesses:
+                // guest frame/vblank/pc prove the freeze (identical across
+                // a sustained pause) and the advancement (resumed).
+                std::printf("host_pause state=%s frame=%llu vblank=%llu "
+                            "pc=0x%08x\n",
+                            host_paused ? "paused" : "resumed",
+                            static_cast<unsigned long long>(ppu.frame_count()),
+                            g_runtime_vblank_starts,
+                            static_cast<unsigned>(g_cpu.R[15]));
+                std::fflush(stdout);
             }
             if (ev.save_slot) {
                 std::string path = slot_path(ev.save_slot);
                 std::string e;
                 if (do_savestate_save(path, e)) {
-                    std::printf("savestate_saved slot=%d path=\"%s\"\n",
-                                ev.save_slot, path.c_str());
+                    std::printf("savestate_saved slot=%d path=\"%s\" "
+                                "pc=0x%08x frame=%llu mem=%s\n",
+                                ev.save_slot, path.c_str(),
+                                static_cast<unsigned>(g_cpu.R[15]),
+                                static_cast<unsigned long long>(
+                                    ppu.frame_count()),
+                                guest_state_digest().c_str());
                     std::fflush(stdout);
                 } else {
                     std::fprintf(stderr,
@@ -3121,9 +3239,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 std::string e;
                 if (do_savestate_load(path, e)) {
                     std::printf("savestate_loaded slot=%d path=\"%s\" pc=0x%08x "
-                                "frame=%llu\n", ev.load_slot, path.c_str(),
+                                "frame=%llu mem=%s\n", ev.load_slot, path.c_str(),
                                 g_cpu.R[15],
-                                static_cast<unsigned long long>(ppu.frame_count()));
+                                static_cast<unsigned long long>(ppu.frame_count()),
+                                guest_state_digest().c_str());
                     std::fflush(stdout);
                     // Force the next iteration to re-present the restored
                     // frame instead of waiting for frame_count to advance.
@@ -3163,9 +3282,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                         next_rewind_capture_frame =
                             ppu.frame_count() + rewind_interval;
                         if (pacer) pacer->reset();
-                        std::printf("rewind_loaded frame=%llu\n",
+                        std::printf("rewind_loaded frame=%llu pc=0x%08x mem=%s\n",
                                     static_cast<unsigned long long>(
-                                        ppu.frame_count()));
+                                        ppu.frame_count()),
+                                    static_cast<unsigned>(g_cpu.R[15]),
+                                    guest_state_digest().c_str());
                         std::fflush(stdout);
                     } else {
                         std::fprintf(stderr,
@@ -3228,6 +3349,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 }
                 const uint64_t fp_t1 = FramePhaseRing::now_ns();
                 if (present_frame) win.present(live_fb.data());
+                // Host presentation boundary (NOT display scanout): monotonic
+                // timestamp just after win.present returned. 0 when skipped.
+                const uint64_t fp_present_ns = present_frame
+                    ? FramePhaseRing::now_ns() : 0u;
                 // Preserve the same diagnostic capture path while the guest
                 // remains on its host stack (including protected IRQ frames).
                 if (framedump_dir && frame >= framedump_start &&
@@ -3262,7 +3387,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     if (pacer) pacer->wait_for_next_frame();
                 }
                 frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3, fp_t4,
-                                   FramePhaseRing::now_ns());
+                                   FramePhaseRing::now_ns(), fp_present_ns);
                 // Dump after recording so the limit-triggered CSV retains the
                 // final presented frame even if the exit-path dump never runs.
                 // The graceful-exit dump below rewrites the same file.
@@ -3622,6 +3747,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 }
                 const uint64_t fp_t1 = FramePhaseRing::now_ns();
                 if (present_frame) win.present(live_fb.data());
+                // Host presentation boundary (NOT display scanout): monotonic
+                // timestamp just after win.present returned. 0 when skipped.
+                const uint64_t fp_present_ns = present_frame
+                    ? FramePhaseRing::now_ns() : 0u;
                 // Framedump (capture runs only) is attributed to present_us.
                 if (framedump_dir && frame >= framedump_start &&
                     framedump_written < framedump_max) {
@@ -3654,7 +3783,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     if (pacer) pacer->wait_for_next_frame();
                 }
                 frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3, fp_t4,
-                                   FramePhaseRing::now_ns());
+                                   FramePhaseRing::now_ns(), fp_present_ns);
                 // Dump after recording so the limit-triggered CSV retains the
                 // final presented frame even if the exit-path dump never runs.
                 if (present_frame && args.frames >= 0 &&
@@ -3812,6 +3941,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     }
 
     gbarecomp::overlay_loader_shutdown();  // join worker + drain before banner
+    if (input_apply_log) {
+        std::fflush(input_apply_log);
+        std::fclose(input_apply_log);
+        input_apply_log = nullptr;
+    }
     emit_exit_diagnostics();
     runtime_shutdown();
     return save_ok ? 0 : 1;

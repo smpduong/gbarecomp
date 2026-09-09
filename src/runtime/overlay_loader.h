@@ -79,6 +79,12 @@ bool overlay_query(uint32_t pc, bool thumb, uint64_t* native_calls);
 // Nanoseconds, monotonic.
 uint64_t overlay_game_thread_compile_ns();
 
+// Cumulative wall ns the WORKER thread has spent inside overlay_compile_one
+// (preload loads + real compiles). Sampled per presented frame; the per-frame
+// delta attributes guest-side hitch time to background healing activity.
+// Nanoseconds, monotonic.
+uint64_t overlay_worker_busy_ns();
+
 // Aggregate counters for the coverage banner + the live `misses` TCP command.
 // Any out-param may be null.
 void overlay_counters(uint64_t* healed_native, uint64_t* native_calls_total,

@@ -17,6 +17,7 @@
 
 #include "overlay_abi.h"
 #include "overlay_compile.h"      // overlay_compile_one, HealBackend, heal_backend_name
+#include "heal_work_queue.h"      // HealWorkQueue (purge-safe shutdown)
 #include "runtime_arm.h"          // g_cpu, g_runtime_*, every runtime/bus/arm fn
 #include "runtime_bus_bridge.h"   // active_bus
 #include "../gba/gba_bus.h"       // rom_ptr / rom_size
@@ -107,9 +108,15 @@ uint64_t                                  s_native_calls_total = 0;
 // Cross-thread work/ready queues:
 std::mutex                  s_work_mtx;
 std::condition_variable     s_work_cv;
-std::deque<OverlayWorkItem> s_work;
+HealWorkQueue               s_work;
 std::thread                 s_worker;
 std::atomic<bool>           s_stop{false};
+// Cumulative wall ns the worker has spent inside overlay_compile_one
+// (both preload loads and real compiles). Sampled per presented frame for
+// hitch attribution; monotonic.
+std::atomic<unsigned long long> s_worker_busy_ns{0};
+// Preload jobs dropped by the last shutdown purge (diagnostic only).
+std::atomic<unsigned long long> s_shutdown_dropped_preloads{0};
 
 std::mutex                  s_ready_mtx;
 std::deque<ReadyEntry>      s_ready;
@@ -319,13 +326,13 @@ void worker_main() {
             std::unique_lock<std::mutex> lk(s_work_mtx);
             s_work_cv.wait(lk, [] { return s_stop.load() || !s_work.empty(); });
             if (s_stop.load() && s_work.empty()) return;
-            w = s_work.front();
-            s_work.pop_front();
+            w = s_work.pop_front();
         }
 
         ReadyEntry r;
         r.key = heal_key(w.pc, w.thumb);
         std::string err;
+        const auto busy_t0 = std::chrono::steady_clock::now();
         if (w.load_only) {
             // Background preload: load the cached artifact if present, never
             // compile. A failure (evicted/stale file) is swallowed silently —
@@ -336,6 +343,12 @@ void worker_main() {
             r.ok = overlay_compile_one(w, dir, &g_callbacks,
                                        /*compile_if_missing=*/false, s_backend,
                                        &r.c, &err);
+            s_worker_busy_ns.fetch_add(
+                static_cast<unsigned long long>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - busy_t0)
+                        .count()),
+                std::memory_order_relaxed);
             if (r.ok) {
                 std::lock_guard<std::mutex> lk(s_ready_mtx);
                 s_ready.push_back(r);
@@ -346,6 +359,12 @@ void worker_main() {
         r.ok = overlay_compile_one(w, s_active_cache_dir, &g_callbacks,
                                    /*compile_if_missing=*/true, s_backend,
                                    &r.c, &err);
+        s_worker_busy_ns.fetch_add(
+            static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - busy_t0)
+                    .count()),
+            std::memory_order_relaxed);
         if (r.ok && self_heal_verbose()) {
             std::fprintf(stderr,
                 "self_heal: HEALED 0x%08X (%s) -> native via %s (crc=%08X, "
@@ -404,7 +423,7 @@ int warm_enqueue_cache_dir(const std::string& dir,
         w.cache_dir = dir;
         {
             std::lock_guard<std::mutex> lk(s_work_mtx);
-            s_work.push_back(std::move(w));
+            s_work.push(std::move(w));
         }
         ++queued;
     }
@@ -516,8 +535,59 @@ void overlay_loader_init(const std::string& cache_root,
 void overlay_loader_shutdown() {
     if (s_worker.joinable()) {
         s_stop.store(true);
+        // Ownership-safe cancellation: drop pending PRELOAD jobs (optional
+        // warm-cache loads; a later real miss compiles fresh and purged
+        // preloads never entered s_inflight/s_failed, so no bookkeeping is
+        // disturbed). Without this, shutdown sequentially dlopen()s the whole
+        // backlog — the observed multi-minute join wedge. Queued real
+        // compiles (bounded, few) and the single in-flight item run to
+        // completion under join: no detach, no state destroyed under the
+        // worker. Residual limitation: one in-flight dlopen()/gcc run cannot
+        // be cancelled; the watchdog below makes a stuck one diagnosable.
+        std::size_t dropped = 0;
+        {
+            std::lock_guard<std::mutex> lk(s_work_mtx);
+            dropped = s_work.purge_preloads();
+        }
+        s_shutdown_dropped_preloads.fetch_add(
+            static_cast<unsigned long long>(dropped),
+            std::memory_order_relaxed);
+        if (dropped > 0) {
+            std::fprintf(stderr,
+                         "self_heal: shutdown dropped %zu pending preload "
+                         "job(s); queued real compiles drain normally\n",
+                         dropped);
+            std::fflush(stderr);
+        }
         s_work_cv.notify_all();
+        // Unconditional join: the worker's lifetime is always clean (no
+        // detach, no timeout-abandon). Elapsed time is measured around the
+        // join: a stuck in-flight dlopen/gcc (which cannot be cancelled —
+        // residual limitation, process exit reclaims it) shows up in the log
+        // instead of as a silent hang.
+        const auto join_t0 = std::chrono::steady_clock::now();
         s_worker.join();
+        const auto waited = std::chrono::steady_clock::now() - join_t0;
+        if (waited > std::chrono::seconds(30)) {
+            std::size_t remaining = 0;
+            {
+                std::lock_guard<std::mutex> lk(s_work_mtx);
+                remaining = s_work.size();
+            }
+            std::fprintf(stderr,
+                         "self_heal: shutdown join waited %lldms "
+                         "(queue remaining=%zu inflight=%zu dropped=%llu); "
+                         "an in-flight dlopen/gcc cannot be cancelled — "
+                         "process exit reclaims it\n",
+                         static_cast<long long>(
+                             std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 waited)
+                                 .count()),
+                         remaining, s_inflight.size(),
+                         s_shutdown_dropped_preloads.load(
+                             std::memory_order_relaxed));
+            std::fflush(stderr);
+        }
     }
     // DLLs are left loaded (immutable code, process-lifetime); the OS reclaims
     // them at exit. Drain any last results so counters/banner are accurate.
@@ -585,7 +655,7 @@ bool overlay_request_compile(uint32_t pc, bool thumb) {
     s_inflight.insert(key);
     {
         std::lock_guard<std::mutex> lk(s_work_mtx);
-        s_work.push_back(w);
+        s_work.push(w);
     }
     s_work_cv.notify_one();
     return false;
@@ -623,6 +693,10 @@ uint64_t overlay_game_thread_compile_ns() {
     // worker thread). Always 0 — kept so the coverage banner's stall metric
     // stays wired and reads as a clean zero.
     return 0;
+}
+
+uint64_t overlay_worker_busy_ns() {
+    return s_worker_busy_ns.load(std::memory_order_relaxed);
 }
 
 void overlay_counters(uint64_t* healed_native, uint64_t* native_calls_total,

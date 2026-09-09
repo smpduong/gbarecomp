@@ -791,6 +791,14 @@ add_gbarecomp_runtime_stack_test(dma_tests tests/dma/test_main.cpp)
 add_gbarecomp_runtime_stack_test(timer_tests tests/timers/test_main.cpp)
 add_gbarecomp_runtime_stack_test(frame_present_tests tests/runtime/frame_present_test.cpp)
 
+add_executable(input_replay_tests tests/runtime/input_replay_test.cpp)
+target_include_directories(input_replay_tests PRIVATE src/runtime)
+add_test(NAME input_replay_tests COMMAND input_replay_tests)
+
+add_executable(heal_work_queue_tests tests/runtime/heal_work_queue_test.cpp)
+target_include_directories(heal_work_queue_tests PRIVATE src/runtime src/armv4t)
+add_test(NAME heal_work_queue_tests COMMAND heal_work_queue_tests)
+
 add_executable(gpio_tests tests/gpio/test_main.cpp)
 target_link_libraries(gpio_tests PRIVATE gbarecomp_gba)
 add_test(NAME gpio_tests COMMAND gpio_tests)
