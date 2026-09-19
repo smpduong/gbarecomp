@@ -27,6 +27,7 @@ Thumbs.db
 *.ppm
 *.rgb
 *.log
+*.wav
 
 # Python bytecode caches.
 **/__pycache__/

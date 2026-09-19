@@ -63,7 +63,8 @@ typedef struct {
 typedef struct {
     uint64_t pushed_frames;
     uint64_t pulled_frames;
-    uint64_t underrun_events;   /* times the ring ran dry mid-pull            */
+    uint64_t underrun_events;   /* legacy name: unfilled OUTPUT FRAMES, not episodes */
+    uint64_t starvation_events; /* distinct shortages, including concealed ones */
     uint64_t overflow_drops;    /* source frames dropped on ring overflow     */
     uint64_t stretch_frames;    /* output frames synthesized by stall conceal */
     uint64_t stretch_events;    /* distinct stall episodes concealed          */
@@ -99,6 +100,10 @@ typedef struct rab_bridge {
     double loop_len;        /* looped region length in source frames           */
     double loop_pos;        /* fractional read cursor within the looped region */
     uint64_t conceal_frames;/* host frames emitted in the current stall        */
+    int    recovering;     /* rebuild target cushion before resuming live      */
+    int    last_mode;      /* 0 silent, 1 live, 2 conceal                       */
+    float  seam_from[2];   /* previous signal at a live/conceal transition      */
+    double seam_mix;       /* crossfade to the new signal over 3ms              */
 
     rab_stats stats;
 } rab_bridge;
@@ -179,7 +184,21 @@ int rab_init(rab_bridge *b, const rab_config *cfg) {
     if (cfg->channels < 1 || cfg->channels > 2) return 2;
     if (cfg->taps < 4 || (cfg->taps & 1)) return 3;
     if (cfg->phases < 16) return 4;
-    if (cfg->source_rate <= 0.0 || cfg->host_rate <= 0.0) return 5;
+    if (!isfinite(cfg->source_rate) || !isfinite(cfg->host_rate) ||
+        cfg->source_rate <= 0.0 || cfg->host_rate <= 0.0) return 5;
+    if (!isfinite(cfg->target_ms) || cfg->target_ms <= 0.0 ||
+        !isfinite(cfg->ring_ms) || cfg->ring_ms < 0.0 ||
+        !isfinite(cfg->preroll_ms) || cfg->preroll_ms < 0.0 ||
+        !isfinite(cfg->kp) || cfg->kp < 0.0 ||
+        !isfinite(cfg->max_correction) || cfg->max_correction < 0.0 ||
+        cfg->max_correction >= 1.0 ||
+        !isfinite(cfg->err_lp_ms) || cfg->err_lp_ms < 0.0 ||
+        !isfinite(cfg->slew_pp_per_s) || cfg->slew_pp_per_s < 0.0 ||
+        !isfinite(cfg->deadband_ms) || cfg->deadband_ms < 0.0 ||
+        !isfinite(cfg->stretch_min_ms) || cfg->stretch_min_ms <= 0.0 ||
+        !isfinite(cfg->stretch_max_ms) || cfg->stretch_max_ms < cfg->stretch_min_ms ||
+        !isfinite(cfg->stretch_xfade_ms) || cfg->stretch_xfade_ms < 0.0 ||
+        !isfinite(cfg->stretch_limit_ms) || cfg->stretch_limit_ms < 0.0) return 8;
 
     memset(b, 0, sizeof(*b));
     b->cfg  = *cfg;
@@ -256,10 +275,11 @@ void rab_push(rab_bridge *b, const int16_t *in, int frames) {
     int ch = b->cfg.channels;
     for (int f = 0; f < frames; ++f) {
         double fill = (double)b->in_count - b->out_pos;
-        if (fill >= (double)(b->cap - 1)) {
+        if (fill >= (double)(b->cap - b->half - 1)) {
             /* Overflow emergency: producer outran consumer past the ring. Drop the
              * oldest source frame by nudging the read cursor forward. Rare under
-             * DRC; the resampler's continuous history limits the audible seam. */
+             * DRC. Reserve the filter's history behind out_pos as well as the
+             * unread data; otherwise wrapped future samples replace old taps. */
             b->out_pos += 1.0;
             b->stats.overflow_drops++;
         }
@@ -278,6 +298,7 @@ static void rab__update_controller(rab_bridge *b, int frames) {
     b->stats.last_fill_ms = fill_ms;
 
     if (!b->primed && fill_ms >= b->prime_ms) b->primed = 1;
+    if (b->recovering && fill_ms >= c->target_ms) b->recovering = 0;
 
     /* One control update per pull, using its actual host duration. A fixed
      * 12 ms assumption changes slew/recovery with device rate and block size. */
@@ -369,9 +390,15 @@ void rab_pull(rab_bridge *b, int16_t *out, int frames) {
         int64_t newest_needed = i + b->half;
         int     have = b->primed && (newest_needed < (int64_t)b->in_count)
                        && ((i - b->half + 1) >= 0);
+        if (b->primed && !have && !b->recovering) {
+            b->recovering = 1;
+            b->stats.starvation_events++;
+        }
+        have = have && !b->recovering;
 
         float s[2] = {0.0f, 0.0f};
         int   delivering = 0;
+        int   mode = 0;
 
         if (have) {
             /* live forward play; caught up to real audio, so leave conceal mode */
@@ -389,6 +416,7 @@ void rab_pull(rab_bridge *b, int16_t *out, int frames) {
             }
             b->out_pos += step;             /* advance only when we consumed live */
             delivering = 1;
+            mode = 1;
         } else if (b->primed && b->cfg.stretch_enable
                    && (b->cfg.stretch_limit_ms <= 0.0 ||
                        b->conceal_frames <
@@ -426,18 +454,36 @@ void rab_pull(rab_bridge *b, int16_t *out, int frames) {
             b->stats.stretch_frames++;
             b->conceal_frames++;
             delivering = 1;
+            mode = 2;
         } else {
             /* not primed, or no history to loop: hold last sample, fade to silence */
             s[0] = b->last_out[0];
             if (ch == 2) s[1] = b->last_out[1];
-            if (b->primed && newest_needed >= (int64_t)b->in_count)
+            if (b->primed)
                 b->stats.underrun_events++;
         }
 
         if (delivering) {
+            // Correlation only aligns the loop period. Entry into the loop
+            // and return to live audio can still differ by a full waveform.
+            // Blend from the last signal instead of making an instantaneous
+            // jump. A convex blend cannot amplify either input or clip it.
+            if (mode != b->last_mode) {
+                b->seam_from[0] = b->last_out[0];
+                b->seam_from[1] = b->last_out[1];
+                b->seam_mix = 0.0;
+            }
+            if (b->seam_mix < 1.0) {
+                for (int c = 0; c < ch; ++c)
+                    s[c] = (float)((1.0 - b->seam_mix) * b->seam_from[c] +
+                                   b->seam_mix * s[c]);
+                b->seam_mix += gstep;
+                if (b->seam_mix > 1.0) b->seam_mix = 1.0;
+            }
             b->last_out[0] = s[0];
             if (ch == 2) b->last_out[1] = s[1];
         }
+        b->last_mode = mode;
 
         /* smooth gate: fade toward 1 when delivering audio, toward 0 else */
         double target_gain = delivering ? 1.0 : 0.0;

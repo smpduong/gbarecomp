@@ -40,6 +40,7 @@
 // crackle fixed on NES. IMPL is defined in exactly this one translation unit.
 #define RECOMP_AUDIO_DRC_IMPL
 #include "recomp_audio_drc.h"
+#include "audio_capture.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -326,6 +327,7 @@ struct Backend {
     // Callback-driven clock-domain bridge (replaces SDL queue push).
     rab_bridge    bridge{};
     bool          bridge_ready = false;
+    AudioCapture audio_capture;
     SDL_mutex*    audio_mtx = nullptr;
     // Opt-in bounded callback observations. The real-time callback only fills
     // this fixed array while already holding audio_mtx; the producer logs it.
@@ -935,6 +937,9 @@ void gba_audio_callback(void* userdata, Uint8* stream, int len) {
             observation.fill_before_ms = rab_fill_ms(&b->bridge);
         }
         rab_pull(&b->bridge, reinterpret_cast<int16_t*>(stream), frames);
+        b->audio_capture.record('C', reinterpret_cast<int16_t*>(stream), frames,
+            rab_fill_ms(&b->bridge), b->bridge.stats.stretch_frames,
+            b->bridge.stats.underrun_events, b->bridge.stats.overflow_drops);
         if (b->audio_event_probe) {
             observation.pulled = b->bridge.stats.pulled_frames;
             observation.stretched = b->bridge.stats.stretch_frames;
@@ -1364,18 +1369,30 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
             cfg.channels    = 1;
             cfg.source_rate = 65536.0;                 // engine's standardized GBA mixer rate
             cfg.host_rate   = static_cast<double>(got.freq);
-            cfg.target_ms   = 25.0;                     // steady cushion: lower SFX
-                                                        // onset latency (was 60;
-                                                        // user-reported 100-200ms
-                                                        // delay with a healthy
-                                                        // bridge). Stays above
-                                                        // the 12ms emergency
-                                                        // floor; underruns
-                                                        // stretch-conceal.
+            // Frame batches are uneven: the MMBN3 trace alternates ~5ms and
+            // ~28ms batches around IRQ work. A 25ms target starves even with
+            // an average 59.7275Hz cadence. 40ms covers a batch plus callback
+            // jitter, without returning to the old 60/250ms latency cushions.
+            cfg.target_ms   = 40.0;
+            if (const char* target = std::getenv("GBARECOMP_AUDIO_TARGET_MS")) {
+                char* end = nullptr;
+                const double ms = std::strtod(target, &end);
+                if (end != target && *end == '\0' && std::isfinite(ms) &&
+                    ms >= 25.0 && ms <= 100.0) cfg.target_ms = ms;
+                else std::fprintf(stderr, "host_window: invalid GBARECOMP_AUDIO_TARGET_MS (25..100); using 40ms\n");
+            }
             // Prime at the steady target. A 250 ms boot cushion persisted into
             // gameplay: a 0.5% drift servo needs ~45 s to drain its 225 ms excess.
             cfg.preroll_ms  = 0.0;
-            if (rab_init(&b->bridge, &cfg) == 0) b->bridge_ready = true;
+            if (b->audio_mtx && rab_init(&b->bridge, &cfg) == 0) {
+                b->bridge_ready = true;
+                b->audio_capture.start(std::getenv("GBARECOMP_AUDIO_CAPTURE"),
+                                       65536, got.freq);
+            } else {
+                std::fprintf(stderr, "host_window: audio bridge initialization failed; audio disabled\n");
+                SDL_CloseAudioDevice(b->audio_dev);
+                b->audio_dev = 0;
+            }
             std::fprintf(stderr,
                          "host_window: audio=bridge driver=%s device=%s "
                          "want=65536Hz/512 cushion=%.0fms preroll=%.0fms got=%dHz/%u\n",
@@ -1385,7 +1402,7 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
                          cfg.target_ms, cfg.preroll_ms, got.freq,
                          static_cast<unsigned>(got.samples));
             std::fflush(stderr);
-            SDL_PauseAudioDevice(b->audio_dev, 0);      // start the callback
+            if (b->audio_dev) SDL_PauseAudioDevice(b->audio_dev, 0);
         }
     }
 
@@ -1531,6 +1548,9 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
     // resampling + a P-only fill servo — no queue underrun, no hard flush.
     SDL_LockMutex(b->audio_mtx);
     rab_push(&b->bridge, samples, static_cast<int>(count)); // mono: count == frames
+    b->audio_capture.record('P', samples, count, rab_fill_ms(&b->bridge),
+        b->bridge.stats.stretch_frames, b->bridge.stats.underrun_events,
+        b->bridge.stats.overflow_drops);
     SDL_UnlockMutex(b->audio_mtx);
 
     if (b->audio_event_probe) {
@@ -1566,12 +1586,13 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
             std::fprintf(stderr,
                 "[gba-audio-probe] pushes=%llu audio=%.1fs bridge_underrun=%llu(%.2f/s) "
                 "stretch=%.0fms(ev=%llu) overflow_drops=%llu fill_ms=%.1f corr=%+.3f%% "
-                "gt_compile=%.1fms(+%.1fms)\n",
+                "gt_compile=%.1fms(+%.1fms) starvation_events=%llu\n",
                 s_pushes, secs, (unsigned long long)st.underrun_events,
                 secs > 0 ? st.underrun_events / secs : 0.0,
                 stretch_ms, (unsigned long long)st.stretch_events,
                 (unsigned long long)st.overflow_drops, fill_ms,
-                st.last_correction * 100.0, gt_ms, gt_dms);
+                st.last_correction * 100.0, gt_ms, gt_dms,
+                (unsigned long long)st.starvation_events);
             std::fflush(stderr);
         }
     }
@@ -1582,6 +1603,7 @@ void HostWindow::close() {
     auto* b = static_cast<Backend*>(impl_);
     b->cadence.dump();  // MC-WS-002: flush the cadence ring (verbose only)
     if (b->audio_dev) SDL_CloseAudioDevice(b->audio_dev);  // stops the callback first
+    b->audio_capture.finish();
     emit_audio_pull_observations(b);
     if (b->bridge_ready) rab_free(&b->bridge);
     if (b->audio_mtx) SDL_DestroyMutex(b->audio_mtx);

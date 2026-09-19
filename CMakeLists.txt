@@ -766,6 +766,17 @@ add_executable(audio_drc_tests tests/runtime/audio_drc_test.cpp)
 target_include_directories(audio_drc_tests PRIVATE src/runtime)
 add_test(NAME audio_drc_tests COMMAND audio_drc_tests)
 
+add_executable(audio_continuity_tests tests/runtime/audio_continuity_test.cpp)
+target_include_directories(audio_continuity_tests PRIVATE src/runtime)
+add_test(NAME audio_continuity_tests COMMAND audio_continuity_tests)
+
+add_executable(audio_bridge_replay tools/audio_bridge_replay.cpp)
+target_include_directories(audio_bridge_replay PRIVATE src/runtime)
+
+add_executable(frame_pacer_tests tests/runtime/frame_pacer_test.cpp)
+target_include_directories(frame_pacer_tests PRIVATE src/runtime)
+add_test(NAME frame_pacer_tests COMMAND frame_pacer_tests)
+
 # Self-heal proposal clustering — pure logic, links only the standalone
 # clustering TU (no runtime/bus/overlay dependencies).
 add_executable(selfheal_cluster_test

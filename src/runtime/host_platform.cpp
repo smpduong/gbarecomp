@@ -96,15 +96,11 @@ void FramePacer::wait_for_next_frame() {
         std::this_thread::yield();
     }
 
-    // Never pay back a late wake with a shortened following frame. That
-    // short/long pair is especially visible during steady pixel scrolling.
-    // Normal sub-millisecond timer error retains the absolute cadence; a
-    // scheduler or present stall above 1.5 ms establishes a fresh full-frame
-    // period instead of producing a visibly short recovery frame.
+    // Preserve the long-term guest/audio rate after small late wakes. Reset
+    // only after a whole missed period; otherwise scheduling jitter accumulates
+    // permanent slowdown beyond the audio servo's correction range.
     const clock::time_point woke = clock::now();
-    constexpr auto kLateTolerance = std::chrono::microseconds(1500);
-    next_ = woke > next_ + kLateTolerance ? woke + period_
-                                          : next_ + period_;
+    next_ = advance_deadline(next_, woke, period_);
 }
 
 std::vector<unsigned char> read_file(const std::string& path, std::string* error) {

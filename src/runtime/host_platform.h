@@ -33,6 +33,16 @@ public:
     // GBA: 16'777'216 Hz / 280'896 cycles-per-frame = 59.7275 Hz.
     static constexpr double kGbaFrameHz = 16777216.0 / 280896.0;
 
+    // Keep an absolute cadence across short scheduling delays. Repeatedly
+    // adding oversleeps to future deadlines slows the audio producer below
+    // the device clock. Large stalls still discard the backlog.
+    static std::chrono::steady_clock::time_point advance_deadline(
+        std::chrono::steady_clock::time_point deadline,
+        std::chrono::steady_clock::time_point woke,
+        std::chrono::nanoseconds period) {
+        return woke > deadline + period ? woke + period : deadline + period;
+    }
+
     explicit FramePacer(double target_hz = kGbaFrameHz);
     ~FramePacer();
 
