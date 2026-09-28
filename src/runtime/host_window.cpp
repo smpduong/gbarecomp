@@ -4,17 +4,24 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <time.h>
 #include <vector>
+#if !defined(_WIN32)
+#include <sys/resource.h>  // getrusage, for the GBARECOMP_SDL_COST probe only
+#endif
 
 #include "color_lut.h"
+#include "load_trace.h"  // load_trace_now_us(), for the [sdl-cost] mono_us stamp
 #include "presentation_layout.h"
 #if defined(GBARECOMP_RUNTIME_UI)
 #include "recomp_runtime_ui.h"
@@ -329,6 +336,22 @@ struct Backend {
     bool          bridge_ready = false;
     AudioCapture audio_capture;
     SDL_mutex*    audio_mtx = nullptr;
+    // Opt-in SDL event-watch probe (GBARECOMP_EVENT_WATCH=1): set once the
+    // watch is installed; records are still capture-gated by the sink.
+    bool          event_watch_installed = false;
+    // Opt-in canary push thread (GBARECOMP_EVENT_CANARY=<interval ms>, honoured
+    // only together with GBARECOMP_EVENT_WATCH=1). It pushes a private user
+    // event from a helper thread and brackets the SDL_PushEvent call with
+    // canary-push-enter/-exit records, so a capture shows whether a long
+    // svcev/pumppoll call blocks queue insertion by ANOTHER thread. It does
+    // not show when the game thread consumes that event. Probe-only: unset by
+    // default, never started without the watch, joined before SDL teardown.
+    bool          event_canary_started = false;
+    int           event_canary_interval_ms = 0;
+    Uint32        event_canary_type = 0;
+    std::atomic<HostWindow*> event_canary_host{nullptr};
+    std::atomic<bool>        event_canary_stop{false};
+    SDL_Thread*   event_canary_thread = nullptr;
     // Opt-in bounded callback observations. The real-time callback only fills
     // this fixed array while already holding audio_mtx; the producer logs it.
     struct AudioPullObservation {
@@ -1094,6 +1117,297 @@ bool runtime_ui_event(RecompRuntimeUi* ui, const SDL_Event& e) {
 }
 #endif
 
+// Capture-gated SDL event-watch probe (GBARECOMP_EVENT_WATCH=1, read once,
+// default off). SDL calls the callback on the event-posting path, including
+// inside SDL_PumpEvents/SDL_PollEvent on the calling thread. On SDL2-compat,
+// this callback can run before final queue admission, so its timestamp shows
+// watch activity, NOT proof of insertion. The marker sink records nothing
+// unless a host-audio capture is active
+// (audio_capture_marker only reads ring state). The watch still executes
+// callbacks without a capture and may perturb timing, so it is opt-in.
+int SDLCALL event_watch_callback(void* userdata, SDL_Event* e) {
+    auto* w = static_cast<HostWindow*>(userdata);
+    if (w && e) {
+        char label[24];
+        std::snprintf(label, sizeof(label), "evwatch:%08x",
+                      static_cast<unsigned>(e->type));
+        w->audio_capture_marker(label);
+    }
+    return 1;
+}
+
+// Install the watch once per window when the opt-in is set; idempotent and
+// cheap afterwards. Installed even before a capture exists so the first
+// capture sees watch activity, but it records only while one is active.
+void maybe_install_event_watch(HostWindow* w, Backend* b) {
+    static const bool enabled = [] {
+        const char* e = std::getenv("GBARECOMP_EVENT_WATCH");
+        return e && *e && *e != '0';
+    }();
+    if (!enabled || b->event_watch_installed) return;
+    SDL_AddEventWatch(event_watch_callback, w);
+    b->event_watch_installed = true;
+}
+
+// Canary thread body (probe only). Each iteration brackets one SDL_PushEvent
+// with two capture markers. A blocked push therefore shows as a long
+// canary-push-enter -> canary-push-exit bracket in the same capture stream as
+// the pump brackets it overlaps, which tests whether the pump call blocks
+// queue insertion from another thread. The markers are
+// no-ops without an active capture, like every other marker.
+int SDLCALL event_canary_thread_main(void* userdata) {
+    auto* b = static_cast<Backend*>(userdata);
+    while (!b->event_canary_stop.load(std::memory_order_relaxed)) {
+        SDL_Delay(static_cast<Uint32>(b->event_canary_interval_ms));
+        if (b->event_canary_stop.load(std::memory_order_relaxed)) break;
+        HostWindow* w = b->event_canary_host.load(std::memory_order_acquire);
+        if (w) w->audio_capture_marker("canary-push-enter");
+        SDL_Event e{};
+        e.type = b->event_canary_type;
+        const int queued = SDL_PushEvent(&e);
+        if (w) {
+            // SDL2: 1 means queued; 0 means filtered; negative means error.
+            // The event watch alone may run before queue admission.
+            w->audio_capture_marker(queued == 1 ? "canary-push-queued"
+                                                 : "canary-push-rejected");
+            w->audio_capture_marker("canary-push-exit");
+        }
+    }
+    return 0;
+}
+
+// Start the canary thread once per window when the opt-in pair is set.
+void maybe_start_event_canary(HostWindow* w, Backend* b) {
+    if (b->event_canary_started) return;
+    static const int interval_ms = [] {
+        const char* e = std::getenv("GBARECOMP_EVENT_CANARY");
+        if (!e || !*e || *e == '0') return 0;
+        int v = std::atoi(e);
+        if (v <= 0) v = 8;          // "1"/unparsable -> default interval
+        if (v < 2) v = 2;
+        if (v > 1000) v = 1000;
+        return v;
+    }();
+    static const bool watch_enabled = [] {
+        const char* e = std::getenv("GBARECOMP_EVENT_WATCH");
+        return e && *e && *e != '0';
+    }();
+    if (!interval_ms || !watch_enabled) return;
+    b->event_canary_started = true;
+    const Uint32 type = SDL_RegisterEvents(1);
+    if (type == static_cast<Uint32>(-1)) {
+        std::fprintf(stderr,
+                     "host_window: event canary disabled (no free user event "
+                     "type: %s)\n", SDL_GetError());
+        std::fflush(stderr);
+        return;
+    }
+    b->event_canary_type = type;
+    b->event_canary_interval_ms = interval_ms;
+    b->event_canary_host.store(w, std::memory_order_release);
+    b->event_canary_stop.store(false, std::memory_order_relaxed);
+    b->event_canary_thread = SDL_CreateThread(event_canary_thread_main,
+                                              "gbarecomp-canary", b);
+    if (!b->event_canary_thread) {
+        b->event_canary_host.store(nullptr, std::memory_order_release);
+        std::fprintf(stderr, "host_window: event canary thread failed: %s\n",
+                     SDL_GetError());
+        std::fflush(stderr);
+        return;
+    }
+    std::fprintf(stderr,
+                 "host_window: event canary active: type=0x%04x interval=%dms\n",
+                 static_cast<unsigned>(type), interval_ms);
+    std::fflush(stderr);
+}
+
+// True for the phase-instrumentation labels added by the stall-attribution
+// work: the enter/exit brackets (fh/render/present/audiopush/pumpfn/
+// rewindcall/hostpump/pumppoll/pumphandle/svcev/pace) and the rewind-capture
+// phase markers. False for the action/save-boundary markers (fast-on/off,
+// pause/resume, presave/postsave, preload/postload, premem-save/premem-load,
+// rewind-trigger), which the sweep and queue tools consume and which must
+// survive GBARECOMP_PHASE_MARKERS=0.
+bool is_phase_marker_label(const char* label) {
+    const std::string s(label);
+    const std::size_t n = s.size();
+    if (n > 6 && s.compare(n - 6, 6, "-enter") == 0) return true;
+    if (n > 5 && s.compare(n - 5, 5, "-exit") == 0) return true;
+    return s == "rewind-fire" || s == "rewind-store" ||
+           s == "rewind-fail" || s == "canary-push-queued" ||
+           s == "canary-push-rejected";
+}
+
+// Balanced host-audio capture marker pair for a scope that can leave through
+// `continue` (the event-handling body below does), so the enter/exit records
+// can never end up unbalanced and stall attribution is never guessed. No-op
+// unless a capture is active: audio_capture_marker() only reads ring state.
+struct CaptureMarkerScope {
+    HostWindow* window;
+    const char* exit_label;
+    CaptureMarkerScope(HostWindow* w, const char* enter, const char* exit)
+        : window(w), exit_label(exit) {
+        if (window) window->audio_capture_marker(enter);
+    }
+    ~CaptureMarkerScope() {
+        if (window) window->audio_capture_marker(exit_label);
+    }
+    CaptureMarkerScope(const CaptureMarkerScope&) = delete;
+    CaptureMarkerScope& operator=(const CaptureMarkerScope&) = delete;
+};
+
+// ── SDL event-call cost probe (GBARECOMP_SDL_COST, opt-in, default off) ────
+// Times each SDL_PumpEvents / SDL_PollEvent call in wall time AND *thread CPU*
+// time (CLOCK_THREAD_CPUTIME_ID). The split is the point: a long call that
+// consumes almost no CPU means the calling thread was parked or blocked
+// inside SDL, while a long call with CPU ~= wall means SDL itself was
+// executing. It answers "does the stall burn CPU or wait?" without any
+// intra-SDL instrumentation. Pure stderr, read-only: it never touches the
+// audio bridge, the capture, or SDL state, so it can run with no capture, no
+// markers and no event watch at all. Disabled it costs one static-bool test
+// per SDL call; enabled it adds two clock reads per call.
+//
+// `GBARECOMP_SDL_COST=<ms>`: threshold for printing an individual call
+// (default/1..=1000; a non-numeric value means the 8 ms default). Every run
+// also prints one summary line at close().
+long long sdl_cost_thread_cpu_ns() {
+#if defined(CLOCK_THREAD_CPUTIME_ID)
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) == 0)
+        return static_cast<long long>(ts.tv_sec) * 1000000000LL +
+               static_cast<long long>(ts.tv_nsec);
+#endif
+    return -1;  // unavailable on this platform
+}
+
+// Whole-process CPU (all threads) in microseconds. Paired with the thread-CPU
+// figure it says whether, during a long call, the process was idle (thread and
+// process CPU both ~0) or another thread was busy (process CPU >> thread CPU).
+long long sdl_cost_process_cpu_us() {
+#if defined(_WIN32)
+    return -1;  // no getrusage(2); diagnostics only run on the audited host
+#else
+    struct rusage ru{};
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return -1;
+    return static_cast<long long>(ru.ru_utime.tv_sec) * 1000000LL +
+           static_cast<long long>(ru.ru_utime.tv_usec) +
+           static_cast<long long>(ru.ru_stime.tv_sec) * 1000000LL +
+           static_cast<long long>(ru.ru_stime.tv_usec);
+#endif
+}
+
+struct SdlCostProbe {
+    bool               enabled      = false;
+    long long          threshold_us = 8000;
+    unsigned long long calls        = 0;
+    unsigned long long over         = 0;
+    long long          total_wall_us = 0;
+    long long          total_cpu_us  = 0;
+    long long          max_wall_us   = 0;
+    long long          max_cpu_us    = 0;
+    long long          max_t_ms      = 0;
+    long long          max_proc_cpu_us = 0;
+    const char*        max_site      = "";
+    // Relative clock so a long call can be classified startup vs post-settle
+    // without the capture/marker stream (the probe runs with capture off too).
+    std::chrono::steady_clock::time_point t0;
+
+    void init() {
+        t0 = std::chrono::steady_clock::now();
+        const char* e = std::getenv("GBARECOMP_SDL_COST");
+        if (!e || !*e || *e == '0') return;
+        char* end = nullptr;
+        long  v   = std::strtol(e, &end, 10);
+        if (end == e || v <= 0) v = 8;   // non-numeric/negative -> 8 ms
+        if (v > 1000) v = 1000;
+        threshold_us = v * 1000;
+        enabled      = true;
+    }
+    void record(const char* site, long long wall_ns, long long cpu_ns,
+                long long proc_cpu_delta_us) {
+        if (!enabled) return;
+        const long long wall_us = wall_ns / 1000;
+        const long long cpu_us  = cpu_ns >= 0 ? cpu_ns / 1000 : -1;
+        const long long t_ms    =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        ++calls;
+        total_wall_us += wall_us;
+        if (cpu_us >= 0) total_cpu_us += cpu_us;
+        if (wall_us >= threshold_us) {
+            ++over;
+            // mono_us is the process-wide monotonic stamp taken *after* the
+            // call, i.e. the end of the window [mono_us - wall_us, mono_us].
+            // It lets a log analyzer intersect this window with the engine's
+            // own [load-trace] dlopen windows (load_trace.h) instead of
+            // inferring causality from stream order.
+            std::fprintf(stderr,
+                         "[sdl-cost] site=%s t_ms=%lld wall_us=%lld "
+                         "cpu_us=%lld proc_cpu_us=%lld mono_us=%lld\n",
+                         site, t_ms, wall_us, cpu_us, proc_cpu_delta_us,
+                         load_trace_now_us());
+            std::fflush(stderr);
+        }
+        if (wall_us > max_wall_us) {
+            max_wall_us      = wall_us;
+            max_cpu_us       = cpu_us;
+            max_proc_cpu_us  = proc_cpu_delta_us;
+            max_t_ms         = t_ms;
+            max_site         = site;
+        }
+    }
+    void report() const {
+        if (!enabled || calls == 0) return;
+        std::fprintf(stderr,
+            "[sdl-cost] summary calls=%llu over_threshold=%llu "
+            "total_wall_us=%lld total_cpu_us=%lld worst_site=%s "
+            "worst_wall_us=%lld worst_cpu_us=%lld worst_proc_cpu_us=%lld "
+            "worst_t_ms=%lld threshold_us=%lld\n",
+            calls, over, total_wall_us, total_cpu_us, max_site,
+            max_wall_us, max_cpu_us, max_proc_cpu_us, max_t_ms, threshold_us);
+        std::fflush(stderr);
+    }
+};
+
+SdlCostProbe& sdl_cost_probe() {
+    static SdlCostProbe p = [] {
+        SdlCostProbe q;
+        q.init();
+        return q;
+    }();
+    return p;
+}
+
+// Times one SDL call; a no-op (beyond a bool test) when the probe is off.
+struct SdlCostScope {
+    bool        on;
+    const char* site;
+    std::chrono::steady_clock::time_point t0;
+    long long   c0 = -1;
+    long long   p0 = -1;
+    explicit SdlCostScope(const char* s)
+        : on(sdl_cost_probe().enabled), site(s) {
+        if (!on) return;
+        c0 = sdl_cost_thread_cpu_ns();
+        p0 = sdl_cost_process_cpu_us();
+        t0 = std::chrono::steady_clock::now();
+    }
+    ~SdlCostScope() {
+        if (!on) return;
+        const auto t1 = std::chrono::steady_clock::now();
+        const long long c1 = sdl_cost_thread_cpu_ns();
+        const long long p1 = sdl_cost_process_cpu_us();
+        sdl_cost_probe().record(
+            site,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
+                .count(),
+            (c0 >= 0 && c1 >= 0) ? c1 - c0 : -1,
+            (p0 >= 0 && p1 >= 0) ? p1 - p0 : -1);
+    }
+    SdlCostScope(const SdlCostScope&) = delete;
+    SdlCostScope& operator=(const SdlCostScope&) = delete;
+};
+
 }  // namespace
 
 HostWindow::HostWindow() = default;
@@ -1129,7 +1443,18 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     }
     const Uint32 controller_flags =
         SDL_INIT_GAMECONTROLLER | SDL_INIT_SENSOR;
-    if ((SDL_WasInit(controller_flags) & controller_flags) !=
+    // Diagnostic A/B toggle (GBARECOMP_NO_GAMEPAD=1, read once, default off):
+    // skip the game-controller/sensor subsystem entirely for this window. Used
+    // to separate the SDL input-device (HIDAPI gamepad/gyro) polling path from
+    // SDL's core platform pump when measuring event-call stalls. Guest input
+    // in scripted runs comes from the replay trace, so this changes only the
+    // host input layer; it is never set in normal play.
+    const bool gamepad_disabled = [] {
+        const char* e = std::getenv("GBARECOMP_NO_GAMEPAD");
+        return e && *e && *e != '0';
+    }();
+    if (!gamepad_disabled &&
+        (SDL_WasInit(controller_flags) & controller_flags) !=
         controller_flags) {
         // HIDAPI is required for DualSense motion data on Windows. This hint
         // is the SDL default, but setting it before subsystem init makes the
@@ -1301,8 +1626,10 @@ bool HostWindow::open(int scale, int base_w, int base_h, const char* title,
     }
 #endif
 
-    open_first_game_controller(b);
-    open_device_gyro(b);
+    if (!gamepad_disabled) {
+        open_first_game_controller(b);
+        open_device_gyro(b);
+    }
 
     // Open the audio device at 65536 Hz mono 16-bit signed. The
     // running BIOS sets SOUNDBIAS resolution=1 which raises the
@@ -1598,9 +1925,51 @@ void HostWindow::push_audio_samples(const int16_t* samples, std::size_t count) {
     }
 }
 
+void HostWindow::audio_capture_marker(const char* label) {
+    if (!open_ || !impl_ || !label) return;
+    // Diagnostic toggle: GBARECOMP_PHASE_MARKERS=0 keeps the PCM capture AND
+    // the action/save-boundary markers, and drops only the phase set (see
+    // is_phase_marker_label), removing the phase *records* while leaving the
+    // sweep's own analysis usable. The older executable's classification
+    // work remains in this binary. Read once; the default remains to record
+    // all markers when a capture is active.
+    static const bool phase_markers_enabled = [] {
+        const char* e = std::getenv("GBARECOMP_PHASE_MARKERS");
+        return !(e && *e && *e == '0');
+    }();
+    if (!phase_markers_enabled && is_phase_marker_label(label)) return;
+    auto* b = static_cast<Backend*>(impl_);
+    if (b->audio_dev == 0 || !b->bridge_ready || !b->audio_mtx ||
+        !b->audio_capture.active()) return;
+    // Same mutex as push/pull, so the marker is ordered exactly against the
+    // P/C records it is used to interpret. Pure instrumentation: the bridge
+    // and the device are only read here.
+    SDL_LockMutex(b->audio_mtx);
+    b->audio_capture.record_marker(label, rab_fill_ms(&b->bridge),
+        b->bridge.stats.stretch_frames, b->bridge.stats.underrun_events,
+        b->bridge.stats.overflow_drops);
+    SDL_UnlockMutex(b->audio_mtx);
+}
+
 void HostWindow::close() {
     if (!impl_) { open_ = false; return; }
     auto* b = static_cast<Backend*>(impl_);
+    // Join the probe canary before any SDL teardown: it records markers, so it
+    // must be gone before audio_mtx is destroyed (and long before SDL_Quit).
+    b->event_canary_stop.store(true, std::memory_order_relaxed);
+    b->event_canary_host.store(nullptr, std::memory_order_release);
+    if (b->event_canary_thread) {
+        SDL_WaitThread(b->event_canary_thread, nullptr);
+        b->event_canary_thread = nullptr;
+    }
+    b->event_canary_started = false;
+    // The watch carries `this` as userdata. Remove it while the window and
+    // capture sink are still alive, before either can be torn down or this
+    // HostWindow can be reopened with a fresh Backend (and a second watch).
+    if (b->event_watch_installed) {
+        SDL_DelEventWatch(event_watch_callback, this);
+        b->event_watch_installed = false;
+    }
     b->cadence.dump();  // MC-WS-002: flush the cadence ring (verbose only)
     if (b->audio_dev) SDL_CloseAudioDevice(b->audio_dev);  // stops the callback first
     b->audio_capture.finish();
@@ -1616,6 +1985,9 @@ void HostWindow::close() {
     if (b->texture)   SDL_DestroyTexture(b->texture);
     if (b->renderer)  SDL_DestroyRenderer(b->renderer);
     if (b->window)    SDL_DestroyWindow(b->window);
+    // Diagnostic only (no-op unless GBARECOMP_SDL_COST is set): publish the
+    // per-run SDL event-call wall/CPU totals for this window.
+    sdl_cost_probe().report();
     delete b;
     impl_ = nullptr;
     open_ = false;
@@ -2001,16 +2373,39 @@ bool HostWindow::fps_readout() const {
 
 void HostWindow::service_events() {
     if (!open_ || !impl_) return;
-    SDL_PumpEvents();
+    auto* b = static_cast<Backend*>(impl_);
+    maybe_install_event_watch(this, b);
+    maybe_start_event_canary(this, b);
+    audio_capture_marker("svcev-enter");
+    {
+        SdlCostScope cost("pump");
+        SDL_PumpEvents();
+    }
+    audio_capture_marker("svcev-exit");
 }
 
 HostWindow::Events HostWindow::pump() {
     Events ev{};
     if (!open_) { ev.quit = true; return ev; }
     auto* b = static_cast<Backend*>(impl_);
+    maybe_install_event_watch(this, b);
+    maybe_start_event_canary(this, b);
 
+    // Capture-phase detail (read-only, no-op without an active capture): the
+    // poll pair separates time inside SDL_PollEvent -> platform/SDL event pump
+    // from the handle pair, which covers everything this loop does with a
+    // dequeued event (hotkeys, touch, ImGui/runtime-UI dispatch). Balanced
+    // against the `continue`s below by CaptureMarkerScope.
     SDL_Event e;
-    while (SDL_PollEvent(&e)) {
+    for (;;) {
+        bool have_event = false;
+        {
+            CaptureMarkerScope poll(this, "pumppoll-enter", "pumppoll-exit");
+            SdlCostScope cost("poll");
+            have_event = SDL_PollEvent(&e) != 0;
+        }
+        if (!have_event) break;
+        CaptureMarkerScope handle(this, "pumphandle-enter", "pumphandle-exit");
 #if defined(GBARECOMP_RUNTIME_UI)
         const bool finger_event =
             e.type == SDL_FINGERDOWN || e.type == SDL_FINGERMOTION ||
@@ -2344,6 +2739,8 @@ int HostWindow::fast_forward_multiplier() const { return 4; }
 
 void HostWindow::push_audio_samples(const int16_t* /*samples*/,
                                     std::size_t /*count*/) {}
+
+void HostWindow::audio_capture_marker(const char* /*label*/) {}
 
 void HostWindow::service_events() {}
 

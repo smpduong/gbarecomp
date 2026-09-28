@@ -17,6 +17,7 @@
 
 #include "overlay_abi.h"
 #include "overlay_compile.h"      // overlay_compile_one, HealBackend, heal_backend_name
+#include "heal_fail_report.h"     // once-per-PC failure diagnostics (report-only)
 #include "heal_work_queue.h"      // HealWorkQueue (purge-safe shutdown)
 #include "runtime_arm.h"          // g_cpu, g_runtime_*, every runtime/bus/arm fn
 #include "runtime_bus_bridge.h"   // active_bus
@@ -53,6 +54,10 @@ struct HealedEntry {
 struct ReadyEntry {
     uint64_t key = 0;
     bool     ok = false;
+    // Echoed from the work item so the drain path can report a failure with
+    // PC/mode even when the compile produced no OverlayCompiled payload.
+    uint32_t pc = 0;
+    bool     thumb = false;
     OverlayCompiled c;
 };
 
@@ -117,6 +122,14 @@ std::atomic<bool>           s_stop{false};
 std::atomic<unsigned long long> s_worker_busy_ns{0};
 // Preload jobs dropped by the last shutdown purge (diagnostic only).
 std::atomic<unsigned long long> s_shutdown_dropped_preloads{0};
+
+// Shared once-per-PC heal-failure reporter (game thread request/drain paths
+// plus the worker thread). Report-only: gates and healing behavior are
+// untouched; the mutex inside the reporter is the only cross-thread state.
+HealFailReporter& heal_fail_reporter() {
+    static HealFailReporter instance;
+    return instance;
+}
 
 std::mutex                  s_ready_mtx;
 std::deque<ReadyEntry>      s_ready;
@@ -331,6 +344,8 @@ void worker_main() {
 
         ReadyEntry r;
         r.key = heal_key(w.pc, w.thumb);
+        r.pc = w.pc;
+        r.thumb = w.thumb;
         std::string err;
         const auto busy_t0 = std::chrono::steady_clock::now();
         if (w.load_only) {
@@ -372,10 +387,11 @@ void worker_main() {
                 w.pc, w.thumb ? "thumb" : "arm", heal_backend_name(s_backend),
                 r.c.crc, w.pc, r.c.end);
         } else if (!r.ok) {
-            std::fprintf(stderr,
-                "self_heal: compile FAILED for 0x%08X (%s): %s - staying on the "
-                "interpreter bridge this session.\n",
-                w.pc, w.thumb ? "thumb" : "arm", err.c_str());
+            // Once-per-PC (same message text as before): the drain path
+            // shares the reporter, so a worker error logs here, not twice.
+            heal_fail_reporter().report(r.key, w.pc, w.thumb,
+                                        HealFailReason::WorkerCompileFailed,
+                                        err.c_str());
         }
 
         {
@@ -612,8 +628,13 @@ bool overlay_request_compile(uint32_t pc, bool thumb) {
     w.thumb = thumb;
     if (!region_bytes(pc, &bytes, &size, &base)) {
         // No immutable image (e.g. a RAM PC) — Stage 4 territory. Don't retry.
-        if (!snapshot_ram_region(pc, &w)) {
+        // Report once per PC with the reason; the gate and behavior are
+        // unchanged (RAM-overlay healing stays opt-in, default off).
+        const bool ram_gate = ram_overlay_heal_enabled();
+        const bool snapshot_ok = ram_gate && snapshot_ram_region(pc, &w);
+        if (const auto reason = classify_ram_heal_failure(ram_gate, snapshot_ok)) {
             s_failed.insert(key);
+            heal_fail_reporter().report(key, pc, thumb, *reason);
             return false;
         }
     } else {
@@ -677,6 +698,10 @@ void overlay_drain_ready() {
             install_healed(r.key, r.c);
         } else {
             s_failed.insert(r.key);
+            // The worker already reported this key through the same reporter,
+            // so this only emits if the worker-side report never ran.
+            heal_fail_reporter().report(r.key, r.pc, r.thumb,
+                                        HealFailReason::WorkerCompileFailed);
         }
     }
 }

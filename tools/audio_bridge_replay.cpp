@@ -62,7 +62,11 @@ int main(int argc, char** argv) {
             throw std::runtime_error("cannot start capture (use a fresh output prefix)");
         std::ifstream events(prefix + "-events.csv");
         std::string line; std::getline(events, line);
-        if (line != "kind,ns,offset,frames,fill_ms,stretch_frames,underrun_frames,overflow_frames")
+        // Accept both the original 8-column header and the current one with
+        // the trailing `label` column ('M' marker records only).
+        const std::string header_base =
+            "kind,ns,offset,frames,fill_ms,stretch_frames,underrun_frames,overflow_frames";
+        if (line != header_base && line != header_base + ",label")
             throw std::runtime_error("invalid event header");
         uint64_t mismatches = 0, pushes = 0, pulls = 0;
         std::vector<int16_t> out;
@@ -71,8 +75,17 @@ int main(int argc, char** argv) {
             std::istringstream row(line);
             char kind; int64_t ns; std::size_t offset, frames;
             double fill; uint64_t stretch, under, over;
-            if (!(row >> kind >> ns >> offset >> frames >> fill >> stretch >> under >> over) ||
-                !frames || frames > 65536) throw std::runtime_error("invalid capture event");
+            if (!(row >> kind >> ns >> offset >> frames >> fill >> stretch >> under >> over))
+                throw std::runtime_error("invalid capture event");
+            std::string label;
+            std::getline(row, label);  // optional trailing label column
+            while (!label.empty() && label.front() == ' ') label.erase(label.begin());
+            if (kind == 'M') {
+                // Action marker: no samples to replay, just re-record it.
+                capture.record_marker(label.c_str(), fill, stretch, under, over);
+                continue;
+            }
+            if (!frames || frames > 65536) throw std::runtime_error("invalid capture event");
             const int16_t* data = nullptr;
             if (kind == 'P') {
                 if (offset != pushes || offset > source.samples.size() ||

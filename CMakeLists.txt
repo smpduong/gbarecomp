@@ -697,6 +697,19 @@ add_executable(mod_audio_tests
 target_include_directories(mod_audio_tests PRIVATE src/gba)
 add_test(NAME mod_audio_tests COMMAND mod_audio_tests)
 
+# GbaAudio snapshot round-trip fixture (square + wave + noise voices).
+# Two strict entries, no WILL_FAIL: --check=preserved requires serialized
+# channels to restore exactly; --check=omitted passes only by demonstrating
+# the specific known ch3/ch4/wave-RAM gap (ch1/ch2 intact, ch3/ch4 silent,
+# early first difference). Any crash, setup failure, or wrong result exits
+# nonzero distinctly. Flip omitted to full equivalence only with a versioned
+# serializer change plus compatibility plan.
+add_executable(audio_snapshot_tests tests/gba/audio_snapshot_test.cpp)
+target_include_directories(audio_snapshot_tests PRIVATE src/gba src/debug)
+target_link_libraries(audio_snapshot_tests PRIVATE gbarecomp_gba)
+add_test(NAME audio_snapshot_preserved COMMAND audio_snapshot_tests --check=preserved)
+add_test(NAME audio_snapshot_omitted COMMAND audio_snapshot_tests --check=omitted)
+
 add_executable(mod_state_tests tests/mod_state/test_main.cpp)
 target_include_directories(mod_state_tests PRIVATE src/debug)
 target_link_libraries(mod_state_tests PRIVATE gbarecomp_debug)
@@ -809,6 +822,10 @@ add_test(NAME input_replay_tests COMMAND input_replay_tests)
 add_executable(heal_work_queue_tests tests/runtime/heal_work_queue_test.cpp)
 target_include_directories(heal_work_queue_tests PRIVATE src/runtime src/armv4t)
 add_test(NAME heal_work_queue_tests COMMAND heal_work_queue_tests)
+
+add_executable(heal_fail_report_tests tests/runtime/heal_fail_report_test.cpp)
+target_include_directories(heal_fail_report_tests PRIVATE src/runtime)
+add_test(NAME heal_fail_report_tests COMMAND heal_fail_report_tests)
 
 add_executable(gpio_tests tests/gpio/test_main.cpp)
 target_link_libraries(gpio_tests PRIVATE gbarecomp_gba)

@@ -1,6 +1,16 @@
 // Opt-in, bounded PCM evidence. record() allocates nothing and performs no I/O.
 // Caller serializes push/pull records with the bridge mutex. finish() runs only
 // after the device has stopped. The WAVs exclude downstream SDL/device effects.
+//
+// Record kinds:
+//   'P' producer push  -- pre-bridge source samples, one record per push.
+//   'C' device callback -- post-bridge output samples, one record per pull.
+//   'M' action marker  -- no samples; a short label names a host-side action
+//                         (save/load boundaries, pause/resume, fast-forward
+//                         level edges, rewind trigger). Recorded in the SAME
+//                         mutex-serialized steady_clock timeline as P/C, so a
+//                         harness can read ring fill and bridge counters AT the
+//                         action instead of estimating them from a push index.
 #pragma once
 #include <algorithm>
 #include <chrono>
@@ -19,6 +29,7 @@ class AudioCapture {
         uint64_t stretch, underrun, overflow;
         double fill;
         char kind;
+        char label[24];  // 'M' only; empty for P/C
     };
     std::string prefix_;
     std::vector<int16_t> source_, output_;
@@ -56,6 +67,11 @@ class AudioCapture {
         return std::fclose(f) == 0 && ok;
     }
 public:
+    // Start/finish occur on the window lifecycle thread, outside the event
+    // watch/canary callbacks. This cheap check keeps ordinary uncaptured
+    // gameplay from taking the audio mutex for diagnostic phase markers.
+    bool active() const noexcept { return !prefix_.empty(); }
+
     bool start(const char* prefix, int source_rate, int host_rate, int seconds = 240) {
         if (!prefix || !*prefix) return false;
         if (source_rate <= 0 || host_rate <= 0 || source_rate > 768000 ||
@@ -88,8 +104,23 @@ public:
         }
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        events_[event_size_++] = {ns, size, n, stretch, underrun, overflow, fill, kind};
+        events_[event_size_++] = {ns, size, n, stretch, underrun, overflow, fill, kind, {}};
         std::memcpy(buffer.data() + size, data, n * sizeof(int16_t)); size += n;
+    }
+    // Append a host-side action marker ('M', no samples). Read-only: the only
+    // effect is the recorded event. Caller holds the bridge mutex, which is
+    // what makes the marker ordering against P/C records trustworthy.
+    void record_marker(const char* label, double fill, uint64_t stretch,
+                       uint64_t underrun, uint64_t overflow) {
+        if (prefix_.empty() || full_) return;
+        if (event_size_ == events_.size()) { full_ = true; return; }
+        const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        Event& e = events_[event_size_++];
+        e.ns = ns; e.offset = 0; e.frames = 0; e.fill = fill;
+        e.stretch = stretch; e.underrun = underrun; e.overflow = overflow;
+        e.kind = 'M'; e.label[0] = '\0';
+        if (label) std::snprintf(e.label, sizeof(e.label), "%s", label);
     }
     bool finish() {
         if (prefix_.empty()) return false;
@@ -97,14 +128,14 @@ public:
         ok = wav(prefix_ + "-output.wav", output_, output_size_, host_rate_) && ok;
         FILE* f = std::fopen((prefix_ + "-events.csv").c_str(), "w");
         if (f) {
-            std::fprintf(f, "kind,ns,offset,frames,fill_ms,stretch_frames,underrun_frames,overflow_frames\n");
+            std::fprintf(f, "kind,ns,offset,frames,fill_ms,stretch_frames,underrun_frames,overflow_frames,label\n");
             for (std::size_t i = 0; i < event_size_; ++i) {
                 const auto& e = events_[i];
-                std::fprintf(f, "%c,%lld,%zu,%zu,%.6f,%llu,%llu,%llu\n", e.kind,
+                std::fprintf(f, "%c,%lld,%zu,%zu,%.6f,%llu,%llu,%llu,%s\n", e.kind,
                     static_cast<long long>(e.ns), e.offset, e.frames, e.fill,
                     static_cast<unsigned long long>(e.stretch),
                     static_cast<unsigned long long>(e.underrun),
-                    static_cast<unsigned long long>(e.overflow));
+                    static_cast<unsigned long long>(e.overflow), e.label);
             }
             ok = !std::ferror(f) && ok;
             ok = (std::fclose(f) == 0) && ok;

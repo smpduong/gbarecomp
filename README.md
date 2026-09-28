@@ -30,6 +30,18 @@ These projects are experimental previews and byproducts of developing the
 framework. The games are the proving ground; the reusable recompiler and
 hardware runtime are the larger goal.
 
+## Current fork work (September 27, 2026)
+
+The MMBN3 White test project has exercised an 8,500-frame exploration/combat
+route. This fork now includes measured host-audio bridge repairs, audio
+snapshot regression tests, and diagnostics for unresolved self-healing code.
+On macOS, background loading of freshly healed code can also stall the host
+event loop; an executable-map pre-warm prototype is available as an opt-in
+experiment, not a shipping default. Save/load audio and device timing, full
+static coverage, physical listening quality, and broader game compatibility
+remain open. See the [audio bridge review](docs/AUDIO_BRIDGE_REVIEW.md) and the
+[MMBN3 White audit](https://github.com/smpduong/MMBN3WhiteRecomp/blob/main/docs/AUDIO_REVIEW_2026-09-19.md).
+
 ## What it is
 
 GBARecomp turns a supported cartridge into a native recompilation project:

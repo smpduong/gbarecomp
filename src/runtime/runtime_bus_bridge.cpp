@@ -607,6 +607,28 @@ static inline void cyc_probe(const char* what, uint32_t amt) {
 static unsigned long long g_pending_cycles = 0;
 static long long          g_event_budget   = 0;
 
+// Snapshot/restore diagnostics (read-only): guest cycles advanced on the
+// master clock but not yet materialized into device state, plus cycles
+// remaining until the next scheduled device event. Logged at save/load
+// boundaries to attribute post-restore device-phase drift. Neither value
+// is serialized; this accessor changes no behavior.
+extern "C" void runtime_pending_cycle_stats(unsigned long long* pending,
+                                            long long* budget) {
+    if (pending) *pending = g_pending_cycles;
+    if (budget) *budget = g_event_budget;
+}
+
+// Source-audio sample marker (read-only): the guest mixer's absolute sample
+// counter at the save/load boundary. Serialized by GbaAudio::serialize
+// (samples_generated_), so a correct restore resumes the exact sample index;
+// logging it at save and load gives an exact source-sample marker for
+// post-restore audio alignment (the harness otherwise estimates the split
+// from guest-frame arithmetic). Returns 0 when no bus is attached yet.
+extern "C" unsigned long long runtime_audio_sample_marker(void) {
+    auto* bus = gbarecomp::g_active_bus;
+    return bus ? bus->audio().samples_generated() : 0ull;
+}
+
 static inline void recompute_event_budget(gba::GbaBus* bus, gba::GbaPpu* ppu) {
     uint32_t h  = ppu->cycles_until_next_event();
     uint32_t ut = bus->io().cycles_until_next_timer_event();
@@ -661,6 +683,33 @@ extern "C" void runtime_mmio_catch_up(void) {
     if (!bus || !ppu || g_pending_cycles == 0) return;
     tick_devices(bus, ppu, static_cast<uint32_t>(g_pending_cycles));
     g_pending_cycles = 0;
+}
+
+// Reset the lazy-device phase after a state restore (opt-in diagnostic
+// path, see GBARECOMP_SAVELOAD_PHASE_SYNC in runtime.cpp). The snapshot
+// records guest CPU/RAM/devices but not the host-side pending/budget pair,
+// so without this the first post-load flush materializes stale pre-load
+// cycles into restored devices. Dropping the stale residue and re-arming
+// the horizon from live devices keeps the restored session phase-aligned.
+// Read-only w.r.t. guest state; shadow-guarded like the other schedulers.
+//
+// Why re-arming (not just dropping pending) matters: with only the save-side
+// flush, the restored devices are current but g_event_budget still holds the
+// pre-load branch's horizon, so the restored branch runs with its devices
+// frozen until that stale budget expires -- the first device event/IRQ is
+// then delivered late (or early) versus the uninterrupted branch. Under
+// normal healing it forks non-monotonically with the stale budget (measured:
+// stale 234/93/26/557/236 fork, 864/466 rejoin, while the restored true
+// horizon is 84 everywhere).
+// recompute_event_budget() sets the budget to the restored D_remaining, so
+// the first post-load flush lands on the restored event exactly.
+extern "C" void runtime_load_phase_reset(void) {
+    if (g_runtime_shadow_tick) return;
+    auto* bus = gbarecomp::g_active_bus;
+    auto* ppu = gbarecomp::g_active_ppu;
+    if (!bus || !ppu) return;
+    g_pending_cycles = 0;
+    recompute_event_budget(bus, ppu);
 }
 
 // Recompute the next-event horizon after a config-changing MMIO write (timer

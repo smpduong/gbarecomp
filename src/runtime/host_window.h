@@ -106,6 +106,51 @@ public:
     // No-op if audio init failed or this build has no SDL2.
     void push_audio_samples(const int16_t* samples, std::size_t count);
 
+    // Read-only host-audio action marker for the GBARECOMP_AUDIO_CAPTURE
+    // events timeline: appends one 'M' record (label + steady-clock ns +
+    // ring fill + bridge counters) under the same audio mutex as the P/C
+    // records, so a harness can read the queue state AT a save/load boundary
+    // instead of estimating it from a push index. No-op unless a capture is
+    // active; never touches the bridge, the queue, or the device.
+    // `GBARECOMP_PHASE_MARKERS=0` (read once, at first use) drops the phase
+    // brackets and rewind-capture phase markers while keeping the capture and
+    // the action/save-boundary markers intact. This removes phase records,
+    // but not all classification work, so it is not identical to the older
+    // uninstrumented executable for timing comparisons.
+    // Default (unset) records every marker.
+    // `GBARECOMP_EVENT_WATCH=1` (read once, at first use; default off) also
+    // installs a capture-gated SDL event watch that records one
+    // `evwatch:<type hex>` marker when a watch callback fires. On the
+    // SDL2-compat backend this may precede final queue admission, so the
+    // watch marker alone does not prove the event was queued.
+    // `GBARECOMP_EVENT_CANARY=<interval ms>` (read once; default off; honoured
+    // only together with the watch) additionally starts a helper thread that
+    // pushes one private user event per interval and brackets the push with
+    // `canary-push-enter/-exit` records, plus a `canary-push-queued` or
+    // `canary-push-rejected` result marker. A queued result verifies that
+    // another thread inserted the event during the bracket; it does not
+    // establish when the game thread later consumes it. The
+    // thread is joined during close() and never started in normal runs.
+    // `GBARECOMP_SDL_COST=<ms>` (read once, at first use; default off) times
+    // each SDL_PumpEvents / SDL_PollEvent call in wall time and *thread CPU*
+    // time and writes `[sdl-cost]` lines to stderr: one per call at or above
+    // the threshold, plus a per-run summary at close(). Thread CPU separates
+    // a call that consumed CPU (SDL executing) from one where the calling
+    // thread was parked or blocked inside SDL. It is independent of the
+    // capture, the markers and the watch (they are not required), and it
+    // changes nothing else. Each line also carries `mono_us=`, the
+    // process-wide monotonic stamp taken after the call (i.e. the end of the
+    // window [mono_us - wall_us, mono_us]), so those windows can be
+    // intersected with the engine's own dlopen windows printed by
+    // `GBARECOMP_LOAD_TRACE=1` (see load_trace.h). Neither stamp changes the
+    // window the probe measures.
+    // `GBARECOMP_NO_GAMEPAD=1` (read once, at open; default off) skips the
+    // game-controller/sensor subsystem for the window, as a diagnostic arm
+    // that isolates SDL's HIDAPI gamepad/gyro polling from the core platform
+    // pump. Scripted runs feed input from the replay trace, so only the host
+    // input layer changes; normal play never sets it.
+    void audio_capture_marker(const char* label);
+
     // Service the native window-system queue without consuming input events.
     // Long guest frames use this to remain responsive between presentations.
     void service_events();

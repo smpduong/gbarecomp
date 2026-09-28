@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <vector>
 
+#include "load_trace.h"    // GBARECOMP_LOAD_TRACE (opt-in load windows)
 #include "overlay_emit.h"   // emit_overlay_c
 #include "../gba/crc32.h"   // gba::crc32
 
@@ -211,11 +212,173 @@ bool load_and_resolve(const std::string& dll, uint32_t pc,
 }
 #else
 #include <dlfcn.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#if defined(__APPLE__)
+#  include <mach-o/dyld.h>  // _NSGetExecutablePath, for the helper spawn
+#endif
+
+// Paths may contain quotes or shell metacharacters. The compiler path below
+// already uses a shell command; quote the diagnostic helper's operands and
+// redirect target as data, never as shell syntax.
+std::string shell_quote(const std::string& value) {
+    std::string quoted = "'";
+    for (char ch : value) {
+        if (ch == '\'') quoted += "'\\''";
+        else quoted += ch;
+    }
+    quoted += '\'';
+    return quoted;
+}
 
 int run_process(const std::string& cmdline, const std::string& logpath,
                 std::string*) {
-    std::string c = cmdline + " > \"" + logpath + "\" 2>&1";
+    std::string c = cmdline + " > " + shell_quote(logpath) + " 2>&1";
     return std::system(c.c_str());
+}
+
+// ── Executable-mapping pre-warm (GBARECOMP_HEAL_PREWARM_MAP=1) ─────────────
+// The per-path first-load cost is charged at the first EXECUTABLE mapping of a
+// file, not by dyld's bookkeeping and not by page-in. Measured on macOS 27
+// (AUDIO_REVIEW §5p) for a never-loaded 17 KB heal shard:
+//
+//   mmap(PROT_READ|PROT_EXEC) + touch + munmap   36.9 / 51.3 / 71.1 ms
+//   then dlopen()                               283 / 292 / 298 us
+//   mmap(PROT_READ) + touch + munmap             32 / 57 / 226 us
+//   then dlopen()                             36.4 / 38.8 / 41.4 ms
+//
+// So the engine can pay that cost through a mapping IT owns, on its own worker
+// thread, without holding dyld's loaders lock, and then dlopen the cheap case.
+// In-process that is what parks the emulation thread's event pump (the pump
+// reaches `_dyld_get_image_name` from AppKit's run-loop work and waits on the
+// same lock). This is the recommended arm: unlike the out-of-process arm below
+// it needs no extra process, and its cost is idle time on the heal worker
+// instead of a lock hold on the whole process.
+//
+// Opt-in, default off, never fatal: an mmap failure falls through to the
+// ordinary in-process load, and the shard is about to be loaded and executed
+// anyway, so this adds no new code-execution surface -- it only decides which
+// thread pays the kernel's first-map cost.
+bool prewarm_map_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("GBARECOMP_HEAL_PREWARM_MAP");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+// Returns the wall time spent (us) so the [load-trace] stream can show what
+// this cost moved off the loaders lock.
+long long prewarm_path_map(const std::string& path) {
+    const long long t0 = load_trace_now_us();
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return 0;
+    struct stat st{};
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+        const size_t len = static_cast<size_t>(st.st_size);
+        void* m = mmap(nullptr, len, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+        if (m != MAP_FAILED) {
+            // Touch one byte per page: that is the configuration the numbers
+            // above were measured in (the cost lands at mmap time, the touches
+            // themselves are free).
+            volatile unsigned char sink = 0;
+            for (size_t o = 0; o < len; o += 4096) {
+                sink ^= static_cast<const unsigned char*>(m)[o];
+            }
+            (void)sink;
+            munmap(m, len);
+        }
+    }
+    close(fd);
+    return load_trace_now_us() - t0;
+}
+
+// ── Out-of-process first load (GBARECOMP_HEAL_OUT_OF_PROCESS_LOAD=1) ────────
+// Measured on macOS 27 (see the consuming game's AUDIO_REVIEW §5o): dyld holds
+// its loaders WRITE lock while it maps an image, and the FIRST load of a path
+// this machine has never loaded costs 36-766 ms for a 17 KB heal shard --
+// 142 ms / 151 ms / 114 ms / 44 ms across attempts -- while the SAME path loads
+// in 0.2-1.9 ms once any process has loaded it, even after its bytes are
+// replaced by a different shard. The cost is per *path*, not per content: a
+// 2 s settle before loading, a full pre-read of the bytes, and a fresh copy at
+// a new path all stayed expensive (45-59 ms / 37-59 ms / 40-114 ms), while
+// rewriting an already-loaded path with different bytes cost 0.3-1.9 ms.
+//
+// That lock is process-wide for dyld, so an in-process first load parks the
+// emulation thread's event pump: with a cold heal cache this engine held
+// dyld's loaders lock ~66 % of a route-1 run (1 666 loads, mean ~130 ms).
+// Paying the cost in a short-lived HELPER PROCESS keeps it against a private
+// loader lock, after which this process's dlopen is the cheap case. The
+// helper is this same executable in a one-shot child mode (see the static
+// initializer below), so no packaging change is needed.
+//
+// Opt-in and default off: on a platform whose first load is already cheap this
+// only adds a process spawn, so nothing changes unless the caller asks for it.
+// A failed helper is non-fatal -- the caller falls through to the normal
+// in-process load.
+bool out_of_process_load_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("GBARECOMP_HEAL_OUT_OF_PROCESS_LOAD");
+        return e && *e && *e != '0';
+    }();
+    return on;
+}
+
+// Absolute path of the running executable ("" if it cannot be resolved, in
+// which case the out-of-process load is skipped and the in-process load used).
+std::string current_executable_path() {
+#if defined(__APPLE__)
+    char     buf[4096];
+    uint32_t size = sizeof(buf);
+    if (_NSGetExecutablePath(buf, &size) != 0) return {};
+    std::error_code ec;
+    auto resolved = fs::canonical(fs::path(buf), ec);
+    return ec ? std::string(buf) : resolved.string();
+#elif defined(__linux__)
+    std::error_code ec;
+    auto target = fs::read_symlink("/proc/self/exe", ec);
+    return ec ? std::string() : target.string();
+#else
+    return {};
+#endif
+}
+
+// Load every ';'-separated path once and leave. Runs before main(), so the
+// child never opens a window, reads a ROM or starts the runtime.
+struct ValidatePathsAtStartup {
+    ValidatePathsAtStartup() {
+        const char* v = std::getenv("GBARECOMP_LOAD_VALIDATE");
+        if (!v || !*v) return;
+        std::string list(v);
+        std::size_t pos = 0;
+        while (pos <= list.size()) {
+            const std::size_t sep = list.find(';', pos);
+            const std::string path =
+                list.substr(pos, sep == std::string::npos ? std::string::npos
+                                                          : sep - pos);
+            if (!path.empty()) {
+                void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
+                if (h) dlclose(h);
+            }
+            if (sep == std::string::npos) break;
+            pos = sep + 1;
+        }
+        std::fflush(nullptr);
+        std::_Exit(0);
+    }
+};
+ValidatePathsAtStartup g_validate_paths_at_startup;
+
+// Spawn the helper for `dll` and wait for it. Returns the process status (0 =
+// the path is now warm for this machine).
+int preload_path_out_of_process(const std::string& dll) {
+    const std::string exe = current_executable_path();
+    if (exe.empty()) return -1;
+    const std::string cmd = "GBARECOMP_LOAD_VALIDATE=" + shell_quote(dll) +
+                            " " + shell_quote(exe);
+    return run_process(cmd, dll + ".validate.log", nullptr);
 }
 // POSIX mirror of the Win32 path above: dlopen/dlsym for
 // LoadLibrary/GetProcAddress. Until this existed, every heal off Windows failed
@@ -228,7 +391,30 @@ bool load_and_resolve(const std::string& dll, uint32_t pc,
                       std::string* err) {
     // RTLD_LOCAL so an overlay's symbols cannot collide with the next one's:
     // every overlay exports the same overlay_abi / overlay_init names.
-    void* h = dlopen(dll.c_str(), RTLD_NOW | RTLD_LOCAL);
+    // LoadTraceScope (inert unless GBARECOMP_LOAD_TRACE is set) brackets the
+    // dlopen CALL ALONE, not the rest of load_and_resolve: the window it prints
+    // is the window dyld's loaders write lock is held for this load, so a pump
+    // stall can be tested for overlap instead of assumed to be caused by it.
+    // dlsym / overlay_init below take the read lock or none at all, so folding
+    // them into the window would misattribute a read-lock wait to a write.
+    //
+    // GBARECOMP_HEAL_OUT_OF_PROCESS_LOAD=1 first pays the path-keyed first-load
+    // cost in a helper process, so the lock this window measures is held for the
+    // cheap case (~0.2-2 ms) instead of the first-load case (36-766 ms).
+    if (prewarm_map_enabled()) {
+        load_trace_note_prewarm(dll.c_str(), prewarm_path_map(dll));
+    } else if (out_of_process_load_enabled() &&
+               preload_path_out_of_process(dll) != 0) {
+        std::fprintf(stderr,
+                     "[load-trace] out-of-process preload failed path=%s "
+                     "(falling back to the in-process load)\n",
+                     dll.c_str());
+    }
+    void* h = nullptr;
+    {
+        LoadTraceScope load_trace(dll.c_str());
+        h = dlopen(dll.c_str(), RTLD_NOW | RTLD_LOCAL);
+    }
     if (!h) {
         const char* e = dlerror();
         if (err) *err = "dlopen(" + dll + ") failed: " + (e ? e : "unknown");

@@ -2006,9 +2006,62 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         sc.mod_state      = &debug::global_mod_state_registry();
         return sc;
     };
+    // Read-only host-audio capture marker sink. These hooks are defined
+    // before HostWindow is constructed (and before the audio bridge exists), so
+    // they reach it through this pointer, assigned once the window exists. It
+    // stays null on headless/TCP paths: the hooks remain valid and record
+    // nothing. See HostWindow::audio_capture_marker.
+    HostWindow* phase_marker_window = nullptr;
+    auto phase_marker = [&](const char* label) {
+        if (phase_marker_window) phase_marker_window->audio_capture_marker(label);
+    };
+    // Opt-in save/load phase normalization (diagnostic experiment; default
+    // off, behavior unchanged when unset). See GBARECOMP_SAVELOAD_PHASE_SYNC.
+    // Values: unset/"0" = off; "save" = save-side flush only; "load" =
+    // load-side reset only; "1"/"both"/any other nonzero = both halves. The
+    // split lets the controlled A/B matrix attribute the fix to one half or
+    // the other; it changes nothing when unset.
+    int phase_sync_mode = 0;  // bit0 = flush-before-save, bit1 = reset-after-load
+    if (const char* e = std::getenv("GBARECOMP_SAVELOAD_PHASE_SYNC");
+        e && e[0] != '\0' && e[0] != '0') {
+        const std::string v(e);
+        phase_sync_mode = (v == "save") ? 1 : (v == "load") ? 2 : 3;
+    }
+    auto phase_sync_save = [&]() -> bool { return (phase_sync_mode & 1) != 0; };
+    auto phase_sync_load = [&]() -> bool { return (phase_sync_mode & 2) != 0; };
     auto do_savestate_save = [&](const std::string& path,
                                  std::string& e) -> bool {
-        return debug::save_state(path.c_str(), make_snapshot_ctx(), &e);
+        // Opt-in phase normalization (diagnostic experiment; default off):
+        // materialize earned-but-unflushed device time BEFORE snapshotting
+        // so the file holds device-current state. Fires only already-earned
+        // device events at their correct guest-cycle points (same events the
+        // next ticks would fire — no duplicates, none skipped); see the
+        // horizon invariant in runtime_bus_bridge.cpp.
+        if (phase_sync_save()) runtime_mmio_catch_up();
+        // Host-audio boundary marker (read-only): ring fill + bridge counters
+        // in the capture's own steady-clock/event timeline, immediately before
+        // the snapshot is taken.
+        phase_marker("presave");
+        const bool ok =
+            debug::save_state(path.c_str(), make_snapshot_ctx(), &e);
+        if (ok) {
+            phase_marker("postsave");
+            // Restore-forensics: device-phase state not covered by the
+            // snapshot (unflushed pending cycles / event budget). Read-only.
+            unsigned long long pending = 0;
+            long long budget = 0;
+            runtime_pending_cycle_stats(&pending, &budget);
+            std::printf("savestate_pending pending=%llu budget=%lld\n",
+                        pending, budget);
+            // Exact source-sample marker at this boundary (serialized with
+            // the snapshot, so the load marker must equal this save marker
+            // on a clean restore). Read-only; used by the restore harness
+            // for exact source-sample alignment, not guest-frame estimation.
+            std::printf("savestate_audio phase=save marker=%llu\n",
+                        runtime_audio_sample_marker());
+            std::fflush(stdout);
+        }
+        return ok;
     };
     // Short integrity digest of guest CPU/memory state for host-control log
     // lines: lets an offline harness assert that a host-queue load restored
@@ -2038,9 +2091,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     };
     auto do_savestate_load = [&](const std::string& path,
                                  std::string& e) -> bool {
+        // Host-audio boundary markers (read-only): exact ring state just
+        // before and just after the restore, in the capture's timeline. The
+        // restore paths deliberately do not touch the host ring.
+        phase_marker("preload");
         if (!debug::load_state(path.c_str(), make_snapshot_ctx(), &e)) {
             return false;
         }
+        phase_marker("postload");
         // Overlay cursors and active delivery are host state, not emulated
         // state. Discard them so a pre-load cue cannot continue over the
         // restored world, but retain the stream capability: loading does not
@@ -2049,6 +2107,43 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         // already-queued native audio remains a separate future flush concern.
         gba_mod_audio_on_savestate_load();
         sync_frame_counter();  // realign vblank_count with restored PPU
+        // Opt-in phase normalization (diagnostic experiment; default off):
+        // drop stale pre-load pending cycles and re-arm the horizon from
+        // the restored devices. Paired with the save-side flush above, the
+        // restored session resumes phase-aligned; without it, the first
+        // post-load flush materializes rewound-away device time.
+        //
+        // Measured necessity under normal healing (see the game's
+        // AUDIO_REVIEW Addendum 3a): save-side flush alone does not reliably
+        // rejoin; the load side is also required. The earlier pure-interpreter
+        // comparison was invalid because those runs did not advance frames.
+        // The snapshot stores the
+        // device state but not the host horizon, so a save-only restore keeps
+        // the STALE pre-load budget instead of the restored device's true
+        // cycles-to-next-event; devices then stay frozen until that stale
+        // horizon expires, shifting the first post-load IRQ visibility and
+        // forking the guest (the fork does NOT track the offset magnitude, so
+        // it is an IRQ-delivery-timing effect, not a threshold). Re-arming the
+        // horizon here pins the first flush to the restored event.
+        if (phase_sync_load()) runtime_load_phase_reset();
+        // Restore-forensics counterpart to the save-side line above:
+        // pending/budget are host-side and intentionally unrestored, so a
+        // nonzero budget here plus any pending reveals the phase the
+        // restored devices resume with. Read-only.
+        {
+            unsigned long long pending = 0;
+            long long budget = 0;
+            runtime_pending_cycle_stats(&pending, &budget);
+            std::printf("savestate_pending pending=%llu budget=%lld\n",
+                        pending, budget);
+            // Exact source-sample marker at this boundary (serialized with
+            // the snapshot, so this load marker must equal the slot save
+            // marker on a clean restore). Read-only; used by the restore
+            // harness for exact source-sample alignment, not estimation.
+            std::printf("savestate_audio phase=load marker=%llu\n",
+                        runtime_audio_sample_marker());
+            std::fflush(stdout);
+        }
         // Re-origin the fingerprint cycle clock + ring at the load point so the
         // recomp and interp oracle share a cycle origin for diff_cycle_trace.py.
         // (The snapshot's absolute cycle count is irrelevant; we diff relative to
@@ -2060,14 +2155,21 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     };
     auto do_savestate_save_bytes = [&](std::vector<uint8_t>& bytes,
                                        std::string& e) -> bool {
-        return debug::save_state_bytes(&bytes, make_snapshot_ctx(), &e);
+        if (phase_sync_save()) runtime_mmio_catch_up();
+        phase_marker("premem-save");
+        const bool ok = debug::save_state_bytes(&bytes, make_snapshot_ctx(), &e);
+        if (ok) phase_marker("postmem-save");
+        return ok;
     };
     auto do_savestate_load_bytes = [&](const std::vector<uint8_t>& bytes,
                                        std::string& e) -> bool {
+        phase_marker("premem-load");
         if (!debug::load_state_bytes(bytes.data(), bytes.size(),
                                      make_snapshot_ctx(), &e)) {
             return false;
         }
+        phase_marker("postmem-load");
+        if (phase_sync_load()) runtime_load_phase_reset();
         sync_frame_counter();
         g_runtime_cycles = 0;
         runtime_fp_reset();
@@ -2085,6 +2187,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // interpreter (bios_smoke) shares src/gba/* device models with this runtime
     // so it can't arbitrate device/bus bugs — gbaref can. Range-limit with
     // GBARECOMP_WRAM_TRACE_LO/_HI (GBA absolute addresses).
+    //
+    // SAMPLING SEMANTICS — important whenever this is pointed at device/MMIO
+    // space: wram_trace_tick samples raw bytes ONCE PER PPU FRAME and emits
+    // only the NET change. For the I/O window that is a PER-FRAME SAMPLED
+    // REGISTER DELTA, not a write stream: intermediate writes inside a frame,
+    // writes that cancel back to the previous value, and all internal device
+    // state are invisible, and there is no ordering within a frame. A match
+    // here is evidence about the sampled register surface only — NOT device
+    // equivalence. (A digested device-state probe would need its own coverage
+    // definition and tests; see the AUDIO_REVIEW addenda.)
     std::FILE* wram_trace_log = nullptr;
     uint32_t wram_trace_lo = 0x00000000u, wram_trace_hi = 0xFFFFFFFFu;
     bool wram_trace_primed = false;
@@ -2306,6 +2418,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     }
 
     HostWindow win;
+    phase_marker_window = &win;  // read-only capture markers; see above
     std::vector<uint8_t> live_fb;
     // MC-WS-002 capture: per-present dump of the exact composed bytes handed to
     // SDL (`live_fb`). Gated by GBARECOMP_FRAMEDUMP_DIR; START = first guest
@@ -2763,16 +2876,26 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #endif
     };
     bool fast_forward_active = false;
+    // Previous fast-forward level, for edge-only capture markers. The level is
+    // recomputed every host pump (Turbo hotkey, launcher/UI latch, or assist
+    // script), so an edge here is exactly one entry/exit of fast-forward.
+    bool fast_forward_prev = false;
     int fast_forward_multiplier = std::clamp(
         win.fast_forward_multiplier(), 2, 10);
     auto capture_rewind_point = [&]() {
         if (!rewind_capacity || !assist_tools_enabled()) return;
         const uint64_t frame = ppu.frame_count();
         if (frame < next_rewind_capture_frame) return;
+        // Read-only capture marker: the cadence gate passed, so the entire
+        // in-memory save below is attributable. premem-save/postmem-save
+        // bracket just the serialization; rewind-store marks the history
+        // push+trim (the only other work this path does). No behavior change.
+        phase_marker("rewind-fire");
         RewindPoint point;
         point.frame = frame;
         std::string e;
         if (!do_savestate_save_bytes(point.state, e)) {
+            phase_marker("rewind-fail");
             std::fprintf(stderr,
                          "[gbarecomp:runtime] rewind capture failed: %s\n",
                          e.c_str());
@@ -2782,6 +2905,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         rewind_history.push_back(std::move(point));
         while (rewind_history.size() > rewind_capacity)
             rewind_history.pop_front();
+        phase_marker("rewind-store");
         next_rewind_capture_frame = frame + rewind_interval;
     };
 
@@ -3039,18 +3163,28 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     std::deque<HostWindow::Events> pending_state_controls;
     auto pump_host_input = [&]() {
         if (!args.window) return;
+        // Read-only capture markers: phase brackets for the whole input pump
+        // and for the two calls that can block inside it (the rewind-capture
+        // service and the SDL event pump). No-op without an active capture;
+        // no behavior change either way. Consumed by
+        // tools/host_stall_attribution.py.
+        phase_marker("pumpfn-enter");
         const bool at_control_boundary =
             !in_frame_present_hook && runtime_host_unwind_safe();
         if (at_control_boundary) {
             runtime_clear_host_control_yield();
             pending_rewind_capture = false;
+            phase_marker("rewindcall-enter");
             capture_rewind_point();
+            phase_marker("rewindcall-exit");
         } else if (rewind_capacity && assist_tools_enabled() &&
                    ppu.frame_count() >= next_rewind_capture_frame) {
             pending_rewind_capture = true;
             runtime_request_host_control_yield();
         }
+        phase_marker("hostpump-enter");
         auto ev = win.pump();
+        phase_marker("hostpump-exit");
         ++assist_script_pump;
         while (assist_script_index < assist_script_events.size() &&
                assist_script_events[assist_script_index].pump <=
@@ -3151,8 +3285,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         fast_forward_multiplier = std::clamp(
             win.fast_forward_multiplier(), 2, 10);
 #endif
-        fast_forward_active = assist_tools_enabled() &&
-                              (ev.fast_forward || fast_forward_latched);
+        const bool fast_forward_now = assist_tools_enabled() &&
+                                      (ev.fast_forward ||
+                                       fast_forward_latched);
+        if (fast_forward_now != fast_forward_prev) {
+            // Read-only capture marker on the LEVEL EDGE, not every pump, in
+            // the capture's own steady-clock timeline. No-op without a
+            // capture; the level itself is applied exactly as before.
+            phase_marker(fast_forward_now ? "fast-on" : "fast-off");
+            fast_forward_prev = fast_forward_now;
+        }
+        fast_forward_active = fast_forward_now;
         // System hotkeys (config.ini [KeyMap], rebindable in the launcher).
         if (ev.toggle_fullscreen) {
             // Toggle between windowed and the configured mode. A session
@@ -3195,6 +3338,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         if (!at_control_boundary) {
             if (!pending_state_controls.empty())
                 runtime_request_host_control_yield();
+            phase_marker("pumpfn-exit");
             return;
         }
         // Preserve every queued edge-triggered action, in arrival order. Do not
@@ -3205,6 +3349,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             if (ev.toggle_pause) {
                 host_paused = !host_paused;
                 if (!host_paused && pacer) pacer->reset();
+                // Read-only capture marker at the applied transition (state-
+                // checked requests that change nothing never get here).
+                phase_marker(host_paused ? "pause" : "resume");
                 // Ordered, valued pause evidence for offline harnesses:
                 // guest frame/vblank/pc prove the freeze (identical across
                 // a sustained pause) and the advancement (resumed).
@@ -3259,6 +3406,11 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 }
             }
             if (ev.rewind) {
+                // Read-only capture marker: the host's rewind TRIGGER reached
+                // the dispatcher. The restore itself is bracketed separately
+                // by premem-load/postmem-load, so a trigger with no load
+                // marker is a rewind that found no usable history.
+                phase_marker("rewind-trigger");
                 const uint64_t current = ppu.frame_count();
                 const uint64_t target = current > 60 ? current - 60 : 0;
                 std::size_t target_index = rewind_history.size();
@@ -3296,6 +3448,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 }
             }
         }
+        phase_marker("pumpfn-exit");
     };
 
     if (args.window) {
@@ -3327,6 +3480,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                      "GBARECOMP_PRESENT_IN_PLACE=0 to disable)\n");
         runtime_set_frame_present_hook([&]() -> bool {
             in_frame_present_hook = true;
+            phase_marker("fh-enter");
             uint64_t frame = ppu.frame_count();
             if (frame != last_presented_frame) {
                 const uint64_t fp_t0 = FramePhaseRing::now_ns();
@@ -3334,6 +3488,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     (frame % static_cast<uint64_t>(
                          fast_forward_multiplier) == 0);
                 if (present_frame) {
+                    phase_marker("render-enter");
                     // View changes can invoke game-owned callbacks; keep them
                     // outside a live exception handler as well.
                     const bool view_changed = runtime_host_unwind_safe() &&
@@ -3346,9 +3501,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                                    bus.io().raw(), bus.vram_ptr(), bus.oam_ptr(),
                                    bus.pal_ptr());
                     }
+                    phase_marker("render-exit");
                 }
                 const uint64_t fp_t1 = FramePhaseRing::now_ns();
-                if (present_frame) win.present(live_fb.data());
+                if (present_frame) {
+                    phase_marker("present-enter");
+                    win.present(live_fb.data());
+                    phase_marker("present-exit");
+                }
                 // Host presentation boundary (NOT display scanout): monotonic
                 // timestamp just after win.present returned. 0 when skipped.
                 const uint64_t fp_present_ns = present_frame
@@ -3365,12 +3525,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     if (++framedump_written >= framedump_max) host_quit = true;
                 }
                 const uint64_t fp_t2 = FramePhaseRing::now_ns();
+                phase_marker("audiopush-enter");
                 int16_t audio_buf[2048];
                 std::size_t n = bus.audio().drain_samples(audio_buf, 2048);
                 if (n > 0 && !fast_forward_active) {
                     gba_mod_audio_mix(audio_buf, n);
                     win.push_audio_samples(audio_buf, n);
                 }
+                phase_marker("audiopush-exit");
                 const uint64_t fp_t3 = FramePhaseRing::now_ns();
                 pump_host_input();
                 // Present-in-place can remain inside a single step_once() for
@@ -3384,7 +3546,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     ++frames_presented;
                     if (args.frames >= 0 && frames_presented >= args.frames)
                         host_quit = true;
+                    phase_marker("pace-enter");
                     if (pacer) pacer->wait_for_next_frame();
+                    phase_marker("pace-exit");
                 }
                 frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3, fp_t4,
                                    FramePhaseRing::now_ns(), fp_present_ns);
@@ -3396,6 +3560,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     frame_phase.dump();
 
             }
+            phase_marker("fh-exit");
             in_frame_present_hook = false;
             return host_quit;
         });
@@ -3735,6 +3900,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     (frame % static_cast<uint64_t>(
                          fast_forward_multiplier) == 0);
                 if (present_frame) {
+                    phase_marker("render-enter");
                     const bool view_changed = sync_resize_driven_view();
                     if (ppu.has_latched_framebuffer() && !view_changed) {
                         std::memcpy(live_fb.data(), ppu.latched_framebuffer(),
@@ -3744,9 +3910,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                                    bus.io().raw(), bus.vram_ptr(), bus.oam_ptr(),
                                    bus.pal_ptr());
                     }
+                    phase_marker("render-exit");
                 }
                 const uint64_t fp_t1 = FramePhaseRing::now_ns();
-                if (present_frame) win.present(live_fb.data());
+                if (present_frame) {
+                    phase_marker("present-enter");
+                    win.present(live_fb.data());
+                    phase_marker("present-exit");
+                }
                 // Host presentation boundary (NOT display scanout): monotonic
                 // timestamp just after win.present returned. 0 when skipped.
                 const uint64_t fp_present_ns = present_frame
@@ -3762,12 +3933,14 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     if (++framedump_written >= framedump_max) host_quit = true;
                 }
                 const uint64_t fp_t2 = FramePhaseRing::now_ns();
+                phase_marker("audiopush-enter");
                 int16_t audio_buf[2048];
                 std::size_t n = bus.audio().drain_samples(audio_buf, 2048);
                 if (n > 0 && !fast_forward_active) {
                     gba_mod_audio_mix(audio_buf, n);
                     win.push_audio_samples(audio_buf, n);
                 }
+                phase_marker("audiopush-exit");
                 const uint64_t fp_t3 = FramePhaseRing::now_ns();
                 pump_host_input();
                 const uint64_t fp_t4 = FramePhaseRing::now_ns();
@@ -3780,7 +3953,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                     // Normal play presents/paces every frame. Fast-forward
                     // runs N guest frames per one paced host presentation,
                     // making its selected multiplier independent of monitor Hz.
+                    phase_marker("pace-enter");
                     if (pacer) pacer->wait_for_next_frame();
+                    phase_marker("pace-exit");
                 }
                 frame_phase.record(frame, fp_t0, fp_t1, fp_t2, fp_t3, fp_t4,
                                    FramePhaseRing::now_ns(), fp_present_ns);
